@@ -1,0 +1,22 @@
+{
+  "recipient": "your-email@example.com",
+  "smtp_method": "redhat",
+  "smtp_server": "smtp.corp.redhat.com",
+  "smtp_port": 25,
+  "sender_email": "your-email@example.com",
+  "teams": {
+    "FS-Net": "rhel-fs-net",
+    "FS-local": "rhel-fs-local",
+    "FS-VFS": "rhel-fs-vfs",
+    "FS-GFS2": "rhel-fs-gfs2"
+  },
+  "custom_fields": {
+    "assigned_team": "customfield_10606",
+    "severity": "customfield_10840",
+    "qa_contact": "customfield_10470",
+    "sfdc_cases": "customfield_10978",
+    "customer_impact": "customfield_10689"
+  },
+  "schedule_time": "08:07",
+  "jira_project": "RHEL"
+}

@@ -1,0 +1,36 @@
+# Environment and credentials
+.env
+.mcp.json
+email_config.json
+
+# Claude Code settings (exclude entire .claude directory)
+.claude/
+
+# Temporary files
+.last_report_sent.txt
+logs/
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
