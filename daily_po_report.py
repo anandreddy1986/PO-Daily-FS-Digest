@@ -94,6 +94,18 @@ class POReportGenerator:
         result = self.jira.search_issues(jql, max_results=100)
         return result.get("issues", [])
 
+    def get_weekend_new_issues(self, team_value):
+        """Get issues created over the weekend (Friday-Sunday, i.e., 24h-72h ago)"""
+        jql = f'project = {self.config["jira_project"]} AND AssignedTeam = "{team_value}" AND type in (Bug, Vulnerability, Story) AND created >= -72h AND created < -24h'
+        result = self.jira.search_issues(jql, max_results=100)
+        return result.get("issues", [])
+
+    def get_weekend_closed_issues(self, team_value):
+        """Get issues closed over the weekend (Friday-Sunday, i.e., 24h-72h ago)"""
+        jql = f'project = {self.config["jira_project"]} AND AssignedTeam = "{team_value}" AND type in (Bug, Vulnerability, Story) AND status changed to (Closed, Done, Resolved) DURING (-72h, -24h)'
+        result = self.jira.search_issues(jql, max_results=100)
+        return result.get("issues", [])
+
     def get_cve_issues(self, team_value):
         """Get active CVE/security issues for a team
 
@@ -164,6 +176,19 @@ class POReportGenerator:
                  status not in (Closed, Done, Resolved, "Release Pending")'''
 
         fields = ["summary", "status", "priority", "assignee", "updated", self.custom_fields["sfdc_cases"], self.custom_fields["customer_impact"], "labels"]
+        result = self.jira.search_issues(jql, fields=fields, max_results=100)
+
+        return result.get("issues", [])
+
+    def get_waiting_on_mr_merge(self, team_value):
+        """Get issues waiting on MR merge (Testable Builds exist but Preliminary Testing not started)"""
+        jql = f'''project = {self.config["jira_project"]} AND AssignedTeam = "{team_value}" AND
+                 type in (Bug, Vulnerability) AND
+                 status = "In Progress" AND
+                 "Testable Builds" is not EMPTY AND
+                 "Preliminary Testing" is EMPTY'''
+
+        fields = ["summary", "status", "priority", "assignee", "updated", self.custom_fields["testable_builds"]]
         result = self.jira.search_issues(jql, fields=fields, max_results=100)
 
         return result.get("issues", [])
@@ -314,27 +339,154 @@ class POReportGenerator:
         new_issues = self.get_new_issues(team_value)
         closed_issues = self.get_closed_issues(team_value)
 
-        html.append(f'<h3 style="color: #2166ac;">📌 New Issues (Last 24h): {len(new_issues)}</h3>')
-        if new_issues:
+        # Group new issues by description for better readability
+        new_groups = self.group_issues_by_description(new_issues, include_severity=True)
+        html.append(f'<h3 style="color: #2166ac;">📌 New Issues (Last 24h): {len(new_groups)}</h3>')
+        if new_groups:
             html.append('<ul style="margin-left: 20px;">')
-            for issue in new_issues[:10]:  # Limit to top 10
-                html.append(f'<li>{self.format_issue_line(issue)}</li>')
-            if len(new_issues) > 10:
-                html.append(f'<li><em>... and {len(new_issues) - 10} more</em></li>')
+            for group_key, group_data in new_groups.items():
+                # Issue header with description and assignee in one line
+                assignees_list = ", ".join(sorted(group_data['assignees'])) if group_data['assignees'] else "Unassigned"
+
+                if group_data["is_cve"]:
+                    html.append(f'<li><strong style="color: #e74c3c;">{group_data["cve_id"]}</strong>: {group_data["description"]} ({assignees_list})')
+                else:
+                    html.append(f'<li>{group_data["description"]} ({assignees_list})')
+
+                # Show severity only if NOT N/A
+                severity = group_data.get('severity', 'N/A')
+                if severity and severity != 'N/A':
+                    html.append(f' <span style="color: #d73027; font-weight: bold; font-size: 0.85em;">[{severity}]</span>')
+
+                html.append('<br>')
+
+                # Show all affected versions as clickable links on second line
+                version_links = []
+                for issue_data in group_data["issues"]:
+                    issue_url = f"{self.jira.url}/browse/{issue_data['key']}"
+                    display_text = issue_data['version'] if issue_data['version'] else issue_data['key']
+                    version_links.append(
+                        f'<a href="{issue_url}" style="color: #3498db; text-decoration: none;" title="{issue_data["status"]} - {issue_data["assignee"]}">{display_text}</a>'
+                    )
+                html.append(f'<span style="color: #666; font-size: 0.85em;">→ {", ".join(version_links)}</span>')
+                html.append('</li>')
+
             html.append('</ul>')
         else:
             html.append('<p style="margin-left: 20px; color: #666;">No new issues</p>')
 
-        html.append(f'<h3 style="color: #2166ac;">✅ Closed Issues (Last 24h): {len(closed_issues)}</h3>')
-        if closed_issues:
+        # Group closed issues by description for better readability
+        closed_groups = self.group_issues_by_description(closed_issues, include_severity=True)
+        html.append(f'<h3 style="color: #2166ac;">✅ Closed Issues (Last 24h): {len(closed_groups)}</h3>')
+        if closed_groups:
             html.append('<ul style="margin-left: 20px;">')
-            for issue in closed_issues[:10]:
-                html.append(f'<li>{self.format_issue_line(issue)}</li>')
-            if len(closed_issues) > 10:
-                html.append(f'<li><em>... and {len(closed_issues) - 10} more</em></li>')
+            for group_key, group_data in closed_groups.items():
+                # Issue header with description and assignee in one line
+                assignees_list = ", ".join(sorted(group_data['assignees'])) if group_data['assignees'] else "Unassigned"
+
+                if group_data["is_cve"]:
+                    html.append(f'<li><strong style="color: #27ae60;">{group_data["cve_id"]}</strong>: {group_data["description"]} ({assignees_list})')
+                else:
+                    html.append(f'<li>{group_data["description"]} ({assignees_list})')
+
+                # Show severity only if NOT N/A
+                severity = group_data.get('severity', 'N/A')
+                if severity and severity != 'N/A':
+                    html.append(f' <span style="color: #d73027; font-weight: bold; font-size: 0.85em;">[{severity}]</span>')
+
+                html.append('<br>')
+
+                # Show all affected versions as clickable links on second line
+                version_links = []
+                for issue_data in group_data["issues"]:
+                    issue_url = f"{self.jira.url}/browse/{issue_data['key']}"
+                    display_text = issue_data['version'] if issue_data['version'] else issue_data['key']
+                    version_links.append(
+                        f'<a href="{issue_url}" style="color: #3498db; text-decoration: none;" title="{issue_data["status"]} - {issue_data["assignee"]}">{display_text}</a>'
+                    )
+                html.append(f'<span style="color: #666; font-size: 0.85em;">→ {", ".join(version_links)}</span>')
+                html.append('</li>')
+
             html.append('</ul>')
         else:
             html.append('<p style="margin-left: 20px; color: #666;">No closed issues</p>')
+
+        # Weekend Catch-Up (only on Mondays)
+        if datetime.now().weekday() == 0:  # Monday
+            weekend_new = self.get_weekend_new_issues(team_value)
+            weekend_closed = self.get_weekend_closed_issues(team_value)
+
+            html.append('<div style="background-color: #fffbf0; border-left: 4px solid #f39c12; padding: 15px; margin: 20px 0;">')
+            html.append('<h4 style="color: #e67e22; margin-top: 0;">📅 Weekend Activity (Fri-Sun)</h4>')
+
+            if weekend_new or weekend_closed:
+                if weekend_new:
+                    weekend_new_groups = self.group_issues_by_description(weekend_new, include_severity=True)
+                    html.append(f'<p style="margin: 10px 0; color: #2166ac;"><strong>📌 New Issues: {len(weekend_new_groups)}</strong></p>')
+                    html.append('<ul style="margin-left: 20px; margin-top: 5px;">')
+                    for group_key, group_data in weekend_new_groups.items():
+                        # Issue header with assignee
+                        assignees_list = ", ".join(sorted(group_data['assignees'])) if group_data['assignees'] else "Unassigned"
+
+                        if group_data["is_cve"]:
+                            html.append(f'<li><strong style="color: #e74c3c;">{group_data["cve_id"]}</strong>: {group_data["description"]} ({assignees_list})')
+                        else:
+                            html.append(f'<li>{group_data["description"]} ({assignees_list})')
+
+                        # Show severity only if NOT N/A
+                        severity = group_data.get('severity', 'N/A')
+                        if severity and severity != 'N/A':
+                            html.append(f' <span style="color: #d73027; font-weight: bold; font-size: 0.85em;">[{severity}]</span>')
+
+                        html.append('<br>')
+
+                        # Show versions as links
+                        version_links = []
+                        for issue_data in group_data["issues"]:
+                            issue_url = f"{self.jira.url}/browse/{issue_data['key']}"
+                            display_text = issue_data['version'] if issue_data['version'] else issue_data['key']
+                            version_links.append(
+                                f'<a href="{issue_url}" style="color: #3498db; text-decoration: none;" title="{issue_data["status"]} - {issue_data["assignee"]}">{display_text}</a>'
+                            )
+                        html.append(f'<span style="color: #666; font-size: 0.85em;">→ {", ".join(version_links)}</span></li>')
+
+                    html.append('</ul>')
+
+                if weekend_closed:
+                    weekend_closed_groups = self.group_issues_by_description(weekend_closed, include_severity=True)
+                    html.append(f'<p style="margin: 10px 0; color: #27ae60;"><strong>✅ Closed Issues: {len(weekend_closed_groups)}</strong></p>')
+                    html.append('<ul style="margin-left: 20px; margin-top: 5px;">')
+                    for group_key, group_data in weekend_closed_groups.items():
+                        # Issue header with assignee
+                        assignees_list = ", ".join(sorted(group_data['assignees'])) if group_data['assignees'] else "Unassigned"
+
+                        if group_data["is_cve"]:
+                            html.append(f'<li><strong>{group_data["cve_id"]}</strong>: {group_data["description"]} ({assignees_list})')
+                        else:
+                            html.append(f'<li>{group_data["description"]} ({assignees_list})')
+
+                        # Show severity only if NOT N/A
+                        severity = group_data.get('severity', 'N/A')
+                        if severity and severity != 'N/A':
+                            html.append(f' <span style="color: #d73027; font-weight: bold; font-size: 0.85em;">[{severity}]</span>')
+
+                        html.append('<br>')
+
+                        # Show versions as links
+                        version_links = []
+                        for issue_data in group_data["issues"]:
+                            issue_url = f"{self.jira.url}/browse/{issue_data['key']}"
+                            display_text = issue_data['version'] if issue_data['version'] else issue_data['key']
+                            version_links.append(
+                                f'<a href="{issue_url}" style="color: #3498db; text-decoration: none;" title="{issue_data["status"]} - {issue_data["assignee"]}">{display_text}</a>'
+                            )
+                        html.append(f'<span style="color: #666; font-size: 0.85em;">→ {", ".join(version_links)}</span></li>')
+
+                    html.append('</ul>')
+            else:
+                html.append('<p style="margin: 10px 0; color: #666;">No activity over the weekend</p>')
+
+            html.append('</div>')
 
         # Section 2: CVE Issues (grouped by CVE ID)
         cve_issues = self.get_cve_issues(team_value)
@@ -444,6 +596,41 @@ class POReportGenerator:
         else:
             html.append('<p style="margin-left: 20px; color: #666;">No integration testing issues</p>')
 
+        # Section 4.5: Waiting on MR Merge (grouped)
+        waiting_mr = self.get_waiting_on_mr_merge(team_value)
+        waiting_mr_groups = self.group_issues_by_description(waiting_mr)
+        html.append(f'<h3 style="color: #f39c12;">⏳ Waiting on MR Merge: {len(waiting_mr_groups)}</h3>')
+        if waiting_mr_groups:
+            html.append('<ul style="margin-left: 20px;">')
+            for group_key, group_data in list(waiting_mr_groups.items())[:15]:
+                # Issue header
+                if group_data["is_cve"]:
+                    html.append(f'<li><strong style="color: #f39c12;">{group_data["cve_id"]}</strong>: {group_data["description"]}<br>')
+                else:
+                    html.append(f'<li>{group_data["description"]}<br>')
+
+                # Show assignees
+                if group_data['assignees']:
+                    assignees_list = ", ".join(sorted(group_data['assignees']))
+                    html.append(f'<span style="color: #666; font-size: 0.9em;">Assignee(s): {assignees_list}</span><br>')
+
+                # Show all versions/instances as clickable links
+                version_links = []
+                for issue_data in group_data["issues"]:
+                    issue_url = f"{self.jira.url}/browse/{issue_data['key']}"
+                    display_text = issue_data['version'] if issue_data['version'] else issue_data['key']
+                    version_links.append(
+                        f'<a href="{issue_url}" style="color: #3498db; text-decoration: none;" title="{issue_data["status"]} - {issue_data["assignee"]}">{display_text}</a>'
+                    )
+                html.append(f'<span style="color: #666; font-size: 0.85em;">Waiting: {", ".join(version_links)}</span>')
+                html.append('</li>')
+
+            if len(waiting_mr_groups) > 15:
+                html.append(f'<li><em>... and {len(waiting_mr_groups) - 15} more items</em></li>')
+            html.append('</ul>')
+        else:
+            html.append('<p style="margin-left: 20px; color: #666;">No issues waiting on MR merge</p>')
+
         # Section 5: Customer Escalations
         escalations = self.get_customer_escalations(team_value)
         html.append(f'<h3 style="color: #d73027;">🚨 Customer Escalations: {len(escalations)}</h3>')
@@ -457,15 +644,38 @@ class POReportGenerator:
         else:
             html.append('<p style="margin-left: 20px; color: #666;">No customer escalations</p>')
 
-        # Section 6: Key Progress
+        # Section 6: Key Progress (grouped)
         progress = self.get_key_progress(team_value)
-        html.append(f'<h3 style="color: #2166ac;">📈 Key Progress: {len(progress)}</h3>')
-        if progress:
+        progress_groups = self.group_issues_by_description(progress)
+        html.append(f'<h3 style="color: #2166ac;">📈 Key Progress: {len(progress_groups)}</h3>')
+        if progress_groups:
             html.append('<ul style="margin-left: 20px;">')
-            for issue in progress[:10]:
-                html.append(f'<li>{self.format_issue_line(issue, include_fields=["status", "assignee"])}</li>')
-            if len(progress) > 10:
-                html.append(f'<li><em>... and {len(progress) - 10} more</em></li>')
+            for group_key, group_data in list(progress_groups.items())[:15]:
+                # Issue header
+                if group_data["is_cve"]:
+                    html.append(f'<li><strong style="color: #2166ac;">{group_data["cve_id"]}</strong>: {group_data["description"]}<br>')
+                else:
+                    html.append(f'<li>{group_data["description"]}<br>')
+
+                # Show assignees
+                if group_data['assignees']:
+                    assignees_list = ", ".join(sorted(group_data['assignees']))
+                    html.append(f'<span style="color: #666; font-size: 0.9em;">Assignee(s): {assignees_list}</span><br>')
+
+                # Show all versions/instances as clickable links with status
+                version_links = []
+                for issue_data in group_data["issues"]:
+                    issue_url = f"{self.jira.url}/browse/{issue_data['key']}"
+                    display_text = issue_data['version'] if issue_data['version'] else issue_data['key']
+                    # Show status in the tooltip
+                    version_links.append(
+                        f'<a href="{issue_url}" style="color: #3498db; text-decoration: none;" title="{issue_data["status"]} - {issue_data["assignee"]}">{display_text}</a>'
+                    )
+                html.append(f'<span style="color: #666; font-size: 0.85em;">Progress: {", ".join(version_links)}</span>')
+                html.append('</li>')
+
+            if len(progress_groups) > 15:
+                html.append(f'<li><em>... and {len(progress_groups) - 15} more items</em></li>')
             html.append('</ul>')
         else:
             html.append('<p style="margin-left: 20px; color: #666;">No key progress items</p>')
@@ -586,7 +796,8 @@ Generated by Daily PO Report System
             return
 
         today = datetime.now().strftime("%B %d, %Y")
-        subject = f"FS Teams Daily Digest - {today}"
+        is_monday = datetime.now().weekday() == 0
+        subject = f"FS Teams Daily Digest - {today}" + (" (with Weekend Activity)" if is_monday else "")
 
         msg = MIMEMultipart('alternative')
         msg['Subject'] = subject
