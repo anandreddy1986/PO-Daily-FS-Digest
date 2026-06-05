@@ -119,7 +119,7 @@ class POReportGenerator:
                  type in (Bug, Vulnerability, Story) AND
                  status not in (Closed, Done, Resolved, "Release Pending")'''
 
-        fields = ["summary", "status", "priority", "assignee", "created", "updated", "issuetype", self.custom_fields["severity"], "labels"]
+        fields = ["summary", "status", "priority", "assignee", "created", "updated", "issuetype", self.custom_fields["severity"], "labels", "duedate"]
         result = self.jira.search_issues(jql, fields=fields, max_results=200)
 
         # Filter for CVE issues in Python
@@ -262,8 +262,9 @@ class POReportGenerator:
                 "key": issue["key"],
                 "version": version,
                 "status": issue["fields"]["status"]["name"],
-                "assignee": issue["fields"].get("assignee", {}).get("displayName", "Unassigned"),
-                "priority": issue["fields"].get("priority", {}).get("name", "Undefined") if issue["fields"].get("priority") else "Undefined"
+                "assignee": issue["fields"]["assignee"]["displayName"] if issue["fields"].get("assignee") else "Unassigned",
+                "priority": issue["fields"]["priority"]["name"] if issue["fields"].get("priority") else "Undefined",
+                "duedate": issue["fields"].get("duedate")
             })
 
             if issue["fields"].get("assignee"):
@@ -509,15 +510,38 @@ class POReportGenerator:
                     details.append(f"Assignee(s): {assignees_list}")
                 html.append(f'<span style="color: #666; font-size: 0.9em;">{" | ".join(details)}</span><br>')
 
-                # Show all affected versions as clickable links
+                # Show all affected versions as clickable links with due dates
                 version_links = []
+                due_dates = []
                 for issue_data in cve_data["issues"]:
                     issue_url = f"{self.jira.url}/browse/{issue_data['key']}"
                     version_info = f"{issue_data['version']}" if issue_data['version'] else issue_data['key']
+
+                    # Build tooltip with status, assignee, and due date
+                    tooltip_parts = [issue_data["status"], issue_data["assignee"]]
+                    if issue_data.get("duedate"):
+                        tooltip_parts.append(f"Due: {issue_data['duedate']}")
+                        due_dates.append(issue_data['duedate'])
+
                     version_links.append(
-                        f'<a href="{issue_url}" style="color: #3498db; text-decoration: none;" title="{issue_data["status"]} - {issue_data["assignee"]}">{version_info}</a>'
+                        f'<a href="{issue_url}" style="color: #3498db; text-decoration: none;" title="{" - ".join(tooltip_parts)}">{version_info}</a>'
                     )
+
                 html.append(f'<span style="color: #666; font-size: 0.85em;">Affects: {", ".join(version_links)}</span>')
+
+                # Show all unique due dates with version counts
+                if due_dates:
+                    from collections import Counter
+                    due_date_counts = Counter(due_dates)
+                    # Sort by date (earliest first)
+                    sorted_dates = sorted(due_date_counts.items())
+
+                    due_date_parts = []
+                    for date, count in sorted_dates:
+                        due_date_parts.append(f"{date} ({count} version{'s' if count > 1 else ''})")
+
+                    html.append(f'<br><span style="color: #e67e22; font-size: 0.85em; font-weight: bold;">⏰ Due Dates: {", ".join(due_date_parts)}</span>')
+
                 html.append('</li>')
 
             if len(cve_groups) > 15:
