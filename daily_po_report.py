@@ -180,6 +180,22 @@ class POReportGenerator:
 
         return result.get("issues", [])
 
+    def get_customer_bugs_new(self, team_value):
+        """Get customer-related bugs in NEW status (SFDC cases, Customer Impact, or bugproxy reported)"""
+        jql = f'''project = {self.config["jira_project"]} AND AssignedTeam = "{team_value}" AND
+                 type in (Bug, Vulnerability, Story) AND
+                 status = "New" AND
+                 ("{self.custom_fields['sfdc_cases']}" IS NOT EMPTY OR
+                  "{self.custom_fields['customer_impact']}" IS NOT EMPTY OR
+                  reporter = "bugproxy bugproxy")'''
+
+        fields = ["summary", "status", "priority", "assignee", "created", "reporter",
+                  self.custom_fields["sfdc_cases"], self.custom_fields["customer_impact"],
+                  self.custom_fields["severity"]]
+        result = self.jira.search_issues(jql, fields=fields, max_results=100)
+
+        return result.get("issues", [])
+
     def get_waiting_on_mr_merge(self, team_value):
         """Get issues waiting on MR merge (Testable Builds exist but Preliminary Testing not started)"""
         jql = f'''project = {self.config["jira_project"]} AND AssignedTeam = "{team_value}" AND
@@ -276,6 +292,135 @@ class POReportGenerator:
         """Group CVE issues by CVE ID - wrapper for backward compatibility"""
         return self.group_issues_by_description(issues, include_severity=True)
 
+    def generate_table_format(self, grouped_data, section_type="cve"):
+        """Generate HTML table for grouped issues
+
+        Args:
+            grouped_data: Dict from group_issues_by_description()
+            section_type: Type of section (cve, prelim, integration, waiting, progress, tasks)
+        """
+        if not grouped_data:
+            return ""
+
+        # Common table styles (compressed)
+        s = "padding:6px;border-bottom:"
+        if section_type == "cve":
+            table_style = f"""<table style="width:100%;border-collapse:collapse;margin-top:10px;font-size:0.9em"><thead><tr style="background-color:#f0f0f0"><th style="{s}2px solid #ddd;text-align:left">CVE ID</th><th style="{s}2px solid #ddd;text-align:left">Description</th><th style="{s}2px solid #ddd;text-align:left">Severity</th><th style="{s}2px solid #ddd;text-align:left">Assignee</th><th style="{s}2px solid #ddd;text-align:center"># Ver</th><th style="{s}2px solid #ddd;text-align:left">Versions</th><th style="{s}2px solid #ddd;text-align:left">Earliest Due</th></tr></thead><tbody>"""
+        else:
+            table_style = f"""<table style="width:100%;border-collapse:collapse;margin-top:10px;font-size:0.9em"><thead><tr style="background-color:#f0f0f0"><th style="{s}2px solid #ddd;text-align:left">Bug/CVE</th><th style="{s}2px solid #ddd;text-align:left">Description</th><th style="{s}2px solid #ddd;text-align:left">Assignee</th><th style="{s}2px solid #ddd;text-align:center"># Ver</th><th style="{s}2px solid #ddd;text-align:left">Versions</th></tr></thead><tbody>"""
+
+        html_rows = []
+
+        # Sort by earliest due date for CVEs (overdue first), otherwise by description
+        if section_type == "cve":
+            def get_earliest_due(group_item):
+                """Get earliest due date, handling None values"""
+                due_dates = [issue.get('duedate') for issue in group_item[1]['issues'] if issue.get('duedate')]
+                return min(due_dates) if due_dates else '9999-99-99'
+
+            sorted_items = sorted(grouped_data.items(), key=get_earliest_due)
+        else:
+            sorted_items = list(grouped_data.items())
+
+        for idx, (group_key, group_data) in enumerate(sorted_items):
+            # Alternate row colors
+            row_bg = "#ffffff" if idx % 2 == 0 else "#f9f9f9"
+
+            # Get data
+            description = group_data["description"]
+            if len(description) > 80:
+                description = description[:77] + "..."
+
+            assignees_list = ", ".join(sorted(group_data['assignees'])) if group_data['assignees'] else "Unassigned"
+            num_versions = len(group_data["issues"])
+
+            # Build version links
+            version_links = []
+            for issue_data in group_data["issues"][:5]:  # Show first 5 versions
+                issue_url = f"{self.jira.url}/browse/{issue_data['key']}"
+                display_text = issue_data['version'] if issue_data['version'] else issue_data['key']
+                version_links.append(
+                    f'<a href="{issue_url}" style="color: #3498db; text-decoration: none;" title="{issue_data["status"]} - {issue_data["assignee"]}">{display_text}</a>'
+                )
+
+            if num_versions > 5:
+                version_links.append(f"<span style='color: #999;'>+{num_versions - 5} more</span>")
+
+            versions_str = ", ".join(version_links)
+
+            # CVE specific columns
+            if section_type == "cve":
+                cve_id = group_data.get("cve_id", "")
+                severity = group_data.get("severity", "N/A")
+
+                # Get first issue key for CVE link
+                first_issue_key = group_data['issues'][0]['key'] if group_data['issues'] else ""
+                first_issue_url = f"{self.jira.url}/browse/{first_issue_key}" if first_issue_key else "#"
+
+                # Build CVE ID display with link
+                if cve_id:
+                    cve_display = f'<a href="{first_issue_url}" style="color: #d73027; text-decoration: none; font-weight: bold;">{cve_id}</a>'
+                else:
+                    cve_display = f'<a href="{first_issue_url}" style="color: #666; text-decoration: none;">Non-CVE</a>'
+
+                # Get earliest due date
+                due_dates = [issue.get('duedate') for issue in group_data['issues'] if issue.get('duedate')]
+                if due_dates:
+                    earliest_due = min(due_dates)
+
+                    # Check if overdue
+                    from datetime import datetime
+                    try:
+                        due_dt = datetime.strptime(earliest_due, "%Y-%m-%d")
+                        now_dt = datetime.now()
+                        is_overdue = due_dt < now_dt
+
+                        if is_overdue:
+                            due_display = f'<span style="color: #d73027; font-weight: bold;">{earliest_due} ⚠️ OVERDUE</span>'
+                        else:
+                            days_left = (due_dt - now_dt).days
+                            if days_left <= 7:
+                                due_display = f'<span style="color: #e67e22; font-weight: bold;">{earliest_due} ({days_left}d)</span>'
+                            else:
+                                due_display = earliest_due
+                    except:
+                        due_display = earliest_due
+                else:
+                    due_display = "-"
+
+                # Severity color coding
+                if severity == "Critical":
+                    severity_display = f'<span style="color: #d73027; font-weight: bold;">{severity}</span>'
+                elif severity == "Important":
+                    severity_display = f'<span style="color: #e67e22; font-weight: bold;">{severity}</span>'
+                elif severity == "Moderate":
+                    severity_display = f'<span style="color: #f39c12;">{severity}</span>'
+                else:
+                    severity_display = severity
+
+                c = "padding:6px;border-bottom:1px solid #eee"
+                html_rows.append(f"""<tr style="background-color:{row_bg}"><td style="{c}">{cve_display}</td><td style="{c}">{description}</td><td style="{c}">{severity_display}</td><td style="{c}">{assignees_list}</td><td style="{c};text-align:center">{num_versions}</td><td style="{c};font-size:0.85em">{versions_str}</td><td style="{c}">{due_display}</td></tr>""")
+            else:
+                # Non-CVE sections - show actual issue key or CVE ID
+                first_issue_key = group_data['issues'][0]['key'] if group_data['issues'] else ""
+                first_issue_url = f"{self.jira.url}/browse/{first_issue_key}" if first_issue_key else "#"
+
+                issue_id = group_data.get("cve_id", "")
+                if issue_id:
+                    # Has CVE ID
+                    issue_display = f'<a href="{first_issue_url}" style="color:#8e44ad;text-decoration:none;font-weight:bold">{issue_id}</a>'
+                else:
+                    # No CVE, show issue key as link with "Bug"/"Task" label
+                    issue_type_label = "Bug" if num_versions == 1 else "Bug"  # Default to Bug
+                    issue_display = f'<a href="{first_issue_url}" style="color:#666;text-decoration:none;font-weight:bold">{first_issue_key}</a>'
+
+                c = "padding:6px;border-bottom:1px solid #eee"
+                html_rows.append(f"""<tr style="background-color:{row_bg}"><td style="{c}">{issue_display}</td><td style="{c}">{description}</td><td style="{c}">{assignees_list}</td><td style="{c};text-align:center">{num_versions}</td><td style="{c}">{versions_str}</td></tr>""")
+
+        table_style += "".join(html_rows)
+        table_style += """</tbody></table>"""
+        return table_style
+
     def format_issue_line(self, issue, include_fields=None):
         """Format a single issue as an HTML line"""
         key = issue["key"]
@@ -331,10 +476,7 @@ class POReportGenerator:
 
     def generate_team_section(self, team_name, team_value):
         """Generate HTML section for one FS team"""
-        html = [f"""
-<div style="margin-bottom: 30px; border: 1px solid #ddd; padding: 20px; border-radius: 5px; background-color: #f9f9f9;">
-<h2 style="color: #d73027; border-bottom: 2px solid #d73027; padding-bottom: 10px;">📊 {team_name}</h2>
-"""]
+        html = [f"""<div style="margin-bottom:40px;border-left:5px solid #2c5aa0;padding:25px;border-radius:8px;background:linear-gradient(to right,#f8f9fa,#ffffff);box-shadow:0 2px 4px rgba(0,0,0,0.1)"><h2 style="color:#2c5aa0;border-bottom:3px solid #2c5aa0;padding-bottom:12px;margin-top:0;font-size:1.4em">📊 {team_name}</h2>"""]
 
         # Section 1: New & Closed Issues
         new_issues = self.get_new_issues(team_value)
@@ -342,7 +484,7 @@ class POReportGenerator:
 
         # Group new issues by description for better readability
         new_groups = self.group_issues_by_description(new_issues, include_severity=True)
-        html.append(f'<h3 style="color: #2166ac;">📌 New Issues (Last 24h): {len(new_groups)}</h3>')
+        html.append(f'<h3 style="color:#1976d2;margin-top:20px">📌 New Issues (Last 24h): {len(new_groups)}</h3>')
         if new_groups:
             html.append('<ul style="margin-left: 20px;">')
             for group_key, group_data in new_groups.items():
@@ -378,7 +520,7 @@ class POReportGenerator:
 
         # Group closed issues by description for better readability
         closed_groups = self.group_issues_by_description(closed_issues, include_severity=True)
-        html.append(f'<h3 style="color: #2166ac;">✅ Closed Issues (Last 24h): {len(closed_groups)}</h3>')
+        html.append(f'<h3 style="color:#388e3c">✅ Closed Issues (Last 24h): {len(closed_groups)}</h3>')
         if closed_groups:
             html.append('<ul style="margin-left: 20px;">')
             for group_key, group_data in closed_groups.items():
@@ -489,253 +631,199 @@ class POReportGenerator:
 
             html.append('</div>')
 
-        # Section 2: CVE Issues (grouped by CVE ID)
+        # Section 2: CVE Issues (TABLE FORMAT)
         cve_issues = self.get_cve_issues(team_value)
         cve_groups = self.group_cves(cve_issues)
-        html.append(f'<h3 style="color: #d73027;">🔒 Active CVEs: {len(cve_groups)}</h3>')
+        html.append(f'<h3 style="color:#c62828">🔒 Active CVEs: {len(cve_groups)}</h3>')
         if cve_groups:
-            html.append('<ul style="margin-left: 20px;">')
-            for cve_id, cve_data in list(cve_groups.items())[:15]:  # Show up to 15 CVEs
-                # CVE header with description
-                if cve_id.startswith("CVE-"):
-                    html.append(f'<li><strong style="color: #d73027;">{cve_id}</strong>: {cve_data["description"]}<br>')
-                else:
-                    # Non-CVE security issue
-                    html.append(f'<li>{cve_data["description"]}<br>')
-
-                # Show severity and assignees
-                details = [f"Severity: {cve_data['severity']}"]
-                if cve_data['assignees']:
-                    assignees_list = ", ".join(sorted(cve_data['assignees']))
-                    details.append(f"Assignee(s): {assignees_list}")
-                html.append(f'<span style="color: #666; font-size: 0.9em;">{" | ".join(details)}</span><br>')
-
-                # Show all affected versions as clickable links with due dates
-                version_links = []
-                due_dates = []
-                for issue_data in cve_data["issues"]:
-                    issue_url = f"{self.jira.url}/browse/{issue_data['key']}"
-                    version_info = f"{issue_data['version']}" if issue_data['version'] else issue_data['key']
-
-                    # Build tooltip with status, assignee, and due date
-                    tooltip_parts = [issue_data["status"], issue_data["assignee"]]
-                    if issue_data.get("duedate"):
-                        tooltip_parts.append(f"Due: {issue_data['duedate']}")
-                        due_dates.append(issue_data['duedate'])
-
-                    version_links.append(
-                        f'<a href="{issue_url}" style="color: #3498db; text-decoration: none;" title="{" - ".join(tooltip_parts)}">{version_info}</a>'
-                    )
-
-                html.append(f'<span style="color: #666; font-size: 0.85em;">Affects: {", ".join(version_links)}</span>')
-
-                # Show all unique due dates with version counts
-                if due_dates:
-                    from collections import Counter
-                    due_date_counts = Counter(due_dates)
-                    # Sort by date (earliest first)
-                    sorted_dates = sorted(due_date_counts.items())
-
-                    due_date_parts = []
-                    for date, count in sorted_dates:
-                        due_date_parts.append(f"{date} ({count} version{'s' if count > 1 else ''})")
-
-                    html.append(f'<br><span style="color: #e67e22; font-size: 0.85em; font-weight: bold;">⏰ Due Dates: {", ".join(due_date_parts)}</span>')
-
-                html.append('</li>')
-
+            html.append(self.generate_table_format(cve_groups, section_type="cve"))
             if len(cve_groups) > 15:
-                html.append(f'<li><em>... and {len(cve_groups) - 15} more CVEs</em></li>')
-            html.append('</ul>')
+                html.append(f'<p style="margin-left: 20px; color: #999; font-style: italic;">... and {len(cve_groups) - 15} more CVEs not shown</p>')
         else:
             html.append('<p style="margin-left: 20px; color: #666;">No active CVEs</p>')
 
-        # Section 3: Prelim Testing Requested (grouped)
+        # Section 3: Prelim Testing Requested (TABLE FORMAT)
         prelim_testing = self.get_prelim_testing_requested(team_value)
         prelim_groups = self.group_issues_by_description(prelim_testing)
-        html.append(f'<h3 style="color: #8e44ad;">🧪 Prelim Testing Requested: {len(prelim_groups)}</h3>')
+        html.append(f'<h3 style="color:#7b1fa2">🧪 Prelim Testing Requested: {len(prelim_groups)}</h3>')
         if prelim_groups:
-            html.append('<ul style="margin-left: 20px;">')
-            for group_key, group_data in list(prelim_groups.items())[:15]:
-                # Issue header
-                if group_data["is_cve"]:
-                    html.append(f'<li><strong style="color: #8e44ad;">{group_data["cve_id"]}</strong>: {group_data["description"]}<br>')
-                else:
-                    html.append(f'<li>{group_data["description"]}<br>')
-
-                # Show assignees
-                if group_data['assignees']:
-                    assignees_list = ", ".join(sorted(group_data['assignees']))
-                    html.append(f'<span style="color: #666; font-size: 0.9em;">Assignee(s): {assignees_list}</span><br>')
-
-                # Show all versions/instances as clickable links
-                version_links = []
-                for issue_data in group_data["issues"]:
-                    issue_url = f"{self.jira.url}/browse/{issue_data['key']}"
-                    display_text = issue_data['version'] if issue_data['version'] else issue_data['key']
-                    version_links.append(
-                        f'<a href="{issue_url}" style="color: #3498db; text-decoration: none;" title="{issue_data["status"]} - {issue_data["assignee"]}">{display_text}</a>'
-                    )
-                html.append(f'<span style="color: #666; font-size: 0.85em;">Affects: {", ".join(version_links)}</span>')
-                html.append('</li>')
-
+            html.append(self.generate_table_format(prelim_groups, section_type="prelim"))
             if len(prelim_groups) > 15:
-                html.append(f'<li><em>... and {len(prelim_groups) - 15} more items</em></li>')
-            html.append('</ul>')
+                html.append(f'<p style="margin-left: 20px; color: #999; font-style: italic;">... and {len(prelim_groups) - 15} more items not shown</p>')
         else:
             html.append('<p style="margin-left: 20px; color: #666;">No prelim testing requested</p>')
 
-        # Section 4: Integration Testing (grouped)
+        # Section 4: Integration Testing (TABLE FORMAT)
         integration_testing = self.get_integration_testing(team_value)
         integration_groups = self.group_issues_by_description(integration_testing)
-        html.append(f'<h3 style="color: #16a085;">🔬 Integration Testing: {len(integration_groups)}</h3>')
+        html.append(f'<h3 style="color:#00897b">🔬 Integration Testing: {len(integration_groups)}</h3>')
         if integration_groups:
-            html.append('<ul style="margin-left: 20px;">')
-            for group_key, group_data in list(integration_groups.items())[:15]:
-                # Issue header
-                if group_data["is_cve"]:
-                    html.append(f'<li><strong style="color: #16a085;">{group_data["cve_id"]}</strong>: {group_data["description"]}<br>')
-                else:
-                    html.append(f'<li>{group_data["description"]}<br>')
-
-                # Show assignees
-                if group_data['assignees']:
-                    assignees_list = ", ".join(sorted(group_data['assignees']))
-                    html.append(f'<span style="color: #666; font-size: 0.9em;">Assignee(s): {assignees_list}</span><br>')
-
-                # Show all versions/instances as clickable links
-                version_links = []
-                for issue_data in group_data["issues"]:
-                    issue_url = f"{self.jira.url}/browse/{issue_data['key']}"
-                    display_text = issue_data['version'] if issue_data['version'] else issue_data['key']
-                    version_links.append(
-                        f'<a href="{issue_url}" style="color: #3498db; text-decoration: none;" title="{issue_data["status"]} - {issue_data["assignee"]}">{display_text}</a>'
-                    )
-                html.append(f'<span style="color: #666; font-size: 0.85em;">Affects: {", ".join(version_links)}</span>')
-                html.append('</li>')
-
+            html.append(self.generate_table_format(integration_groups, section_type="integration"))
             if len(integration_groups) > 15:
-                html.append(f'<li><em>... and {len(integration_groups) - 15} more items</em></li>')
-            html.append('</ul>')
+                html.append(f'<p style="margin-left: 20px; color: #999; font-style: italic;">... and {len(integration_groups) - 15} more items not shown</p>')
         else:
             html.append('<p style="margin-left: 20px; color: #666;">No integration testing issues</p>')
 
-        # Section 4.5: Waiting on MR Merge (grouped)
+        # Section 4.5: Waiting on MR Merge (TABLE FORMAT)
         waiting_mr = self.get_waiting_on_mr_merge(team_value)
         waiting_mr_groups = self.group_issues_by_description(waiting_mr)
-        html.append(f'<h3 style="color: #f39c12;">⏳ Waiting on MR Merge: {len(waiting_mr_groups)}</h3>')
+        html.append(f'<h3 style="color:#f57c00">⏳ Waiting on MR Merge: {len(waiting_mr_groups)}</h3>')
         if waiting_mr_groups:
-            html.append('<ul style="margin-left: 20px;">')
-            for group_key, group_data in list(waiting_mr_groups.items())[:15]:
-                # Issue header
-                if group_data["is_cve"]:
-                    html.append(f'<li><strong style="color: #f39c12;">{group_data["cve_id"]}</strong>: {group_data["description"]}<br>')
-                else:
-                    html.append(f'<li>{group_data["description"]}<br>')
-
-                # Show assignees
-                if group_data['assignees']:
-                    assignees_list = ", ".join(sorted(group_data['assignees']))
-                    html.append(f'<span style="color: #666; font-size: 0.9em;">Assignee(s): {assignees_list}</span><br>')
-
-                # Show all versions/instances as clickable links
-                version_links = []
-                for issue_data in group_data["issues"]:
-                    issue_url = f"{self.jira.url}/browse/{issue_data['key']}"
-                    display_text = issue_data['version'] if issue_data['version'] else issue_data['key']
-                    version_links.append(
-                        f'<a href="{issue_url}" style="color: #3498db; text-decoration: none;" title="{issue_data["status"]} - {issue_data["assignee"]}">{display_text}</a>'
-                    )
-                html.append(f'<span style="color: #666; font-size: 0.85em;">Waiting: {", ".join(version_links)}</span>')
-                html.append('</li>')
-
+            html.append(self.generate_table_format(waiting_mr_groups, section_type="waiting"))
             if len(waiting_mr_groups) > 15:
-                html.append(f'<li><em>... and {len(waiting_mr_groups) - 15} more items</em></li>')
-            html.append('</ul>')
+                html.append(f'<p style="margin-left: 20px; color: #999; font-style: italic;">... and {len(waiting_mr_groups) - 15} more items not shown</p>')
         else:
             html.append('<p style="margin-left: 20px; color: #666;">No issues waiting on MR merge</p>')
 
-        # Section 5: Customer Escalations
+        # Section 5: Customer Escalations (TABLE FORMAT)
         escalations = self.get_customer_escalations(team_value)
-        html.append(f'<h3 style="color: #d73027;">🚨 Customer Escalations: {len(escalations)}</h3>')
+        html.append(f'<h3 style="color:#d73027">🚨 Customer Escalations: {len(escalations)}</h3>')
         if escalations:
-            html.append('<ul style="margin-left: 20px;">')
-            for issue in escalations[:10]:
-                html.append(f'<li>{self.format_issue_line(issue, include_fields=["priority", "sfdc_cases", "assignee", "updated"])}</li>')
-            if len(escalations) > 10:
-                html.append(f'<li><em>... and {len(escalations) - 10} more</em></li>')
-            html.append('</ul>')
-        else:
-            html.append('<p style="margin-left: 20px; color: #666;">No customer escalations</p>')
+            s = "padding:6px;border-bottom:"
+            table_html = f"""<table style="width:100%;border-collapse:collapse;margin-top:10px;font-size:0.9em"><thead><tr style="background-color:#f0f0f0"><th style="{s}2px solid #ddd;text-align:left">Issue</th><th style="{s}2px solid #ddd;text-align:left">Summary</th><th style="{s}2px solid #ddd;text-align:center">Priority</th><th style="{s}2px solid #ddd;text-align:left">Assignee</th><th style="{s}2px solid #ddd;text-align:left">Last Updated</th></tr></thead><tbody>"""
 
-        # Section 6: Key Progress (grouped)
+            for idx, issue in enumerate(escalations[:10]):
+                key = issue["key"]
+                summary = issue["fields"]["summary"]
+                issue_url = f"{self.jira.url}/browse/{key}"
+
+                if len(summary) > 100:
+                    summary = summary[:97] + "..."
+
+                priority = issue["fields"].get("priority", {}).get("name", "N/A") if issue["fields"].get("priority") else "N/A"
+                assignee = issue["fields"].get("assignee", {}).get("displayName", "Unassigned") if issue["fields"].get("assignee") else "Unassigned"
+
+                updated = issue["fields"].get("updated", "")
+                if updated:
+                    updated_dt = datetime.fromisoformat(updated.replace('Z', '+00:00'))
+                    updated_str = self._time_ago(updated_dt)
+                else:
+                    updated_str = "Unknown"
+
+                # Priority color coding
+                if priority == "Blocker":
+                    priority_display = f'<span style="color:#d73027;font-weight:bold">{priority}</span>'
+                elif priority == "Critical":
+                    priority_display = f'<span style="color:#e67e22;font-weight:bold">{priority}</span>'
+                elif priority == "Major":
+                    priority_display = f'<span style="color:#f39c12">{priority}</span>'
+                else:
+                    priority_display = priority
+
+                row_bg = "#fff" if idx % 2 == 0 else "#f9f9f9"
+                c = "padding:6px;border-bottom:1px solid #eee"
+                table_html += f"""<tr style="background-color:{row_bg}"><td style="{c}"><a href="{issue_url}" style="color:#3498db;text-decoration:none;font-weight:bold">{key}</a></td><td style="{c}">{summary}</td><td style="{c};text-align:center">{priority_display}</td><td style="{c}">{assignee}</td><td style="{c}">{updated_str}</td></tr>"""
+
+            table_html += """</tbody></table>"""
+            html.append(table_html)
+
+            if len(escalations) > 10:
+                html.append(f'<p style="margin-left:20px;color:#999;font-style:italic">... and {len(escalations) - 10} more escalations</p>')
+        else:
+            html.append('<p style="margin-left:20px;color:#666">No customer escalations</p>')
+
+        # Section 5.5: Customer Bugs in NEW Status (TABLE FORMAT)
+        customer_bugs_new = self.get_customer_bugs_new(team_value)
+        html.append(f'<h3 style="color:#e74c3c">🆕 Customer Bugs in NEW Status (Needs Triage): {len(customer_bugs_new)}</h3>')
+        if customer_bugs_new:
+            # Generate table
+            s = "padding:6px;border-bottom:"
+            table_html = f"""<table style="width:100%;border-collapse:collapse;margin-top:10px;font-size:0.9em"><thead><tr style="background-color:#f0f0f0"><th style="{s}2px solid #ddd;text-align:left">Issue</th><th style="{s}2px solid #ddd;text-align:left">Summary</th><th style="{s}2px solid #ddd;text-align:center">Source</th><th style="{s}2px solid #ddd;text-align:center">Severity</th><th style="{s}2px solid #ddd;text-align:left">Created</th><th style="{s}2px solid #ddd;text-align:left">Assignee</th></tr></thead><tbody>"""
+
+            for idx, issue in enumerate(customer_bugs_new[:15]):
+                key = issue["key"]
+                summary = issue["fields"]["summary"]
+                issue_url = f"{self.jira.url}/browse/{key}"
+
+                # Truncate summary if too long
+                if len(summary) > 100:
+                    summary = summary[:97] + "..."
+
+                # Extract reporter info
+                reporter = issue["fields"].get("reporter", {})
+                reporter_name = reporter.get("displayName", "Unknown") if reporter else "Unknown"
+                is_bugproxy = reporter_name == "bugproxy bugproxy"
+
+                # Check for SFDC cases
+                sfdc_cases = issue["fields"].get(self.custom_fields["sfdc_cases"])
+                has_sfdc = sfdc_cases is not None and sfdc_cases != ""
+
+                # Get severity
+                severity_field = issue["fields"].get(self.custom_fields["severity"])
+                severity = severity_field.get("value", "N/A") if severity_field else "N/A"
+
+                # Get created date
+                created = issue["fields"].get("created", "")
+                if created:
+                    created_dt = datetime.fromisoformat(created.replace('Z', '+00:00'))
+                    created_str = created_dt.strftime("%b %d")
+                    # Calculate age
+                    age_days = (datetime.now(created_dt.tzinfo) - created_dt).days
+                else:
+                    created_str = "Unknown"
+                    age_days = 0
+
+                # Get assignee
+                assignee = issue["fields"].get("assignee")
+                assignee_name = assignee.get("displayName") if assignee else "Unassigned"
+
+                # Build source badges
+                source_badges = []
+                if is_bugproxy:
+                    source_badges.append('<span style="background-color:#3498db;color:white;padding:2px 4px;border-radius:2px;font-size:0.75em;font-weight:bold">IBM</span>')
+                if has_sfdc:
+                    source_badges.append('<span style="background-color:#e67e22;color:white;padding:2px 4px;border-radius:2px;font-size:0.75em;font-weight:bold">SFDC</span>')
+                source_display = " ".join(source_badges) if source_badges else "-"
+
+                # Severity display with color
+                if severity == "Critical":
+                    severity_display = f'<span style="color:#d73027;font-weight:bold">{severity}</span>'
+                elif severity == "Important":
+                    severity_display = f'<span style="color:#e67e22;font-weight:bold">{severity}</span>'
+                elif severity == "Moderate":
+                    severity_display = f'<span style="color:#f39c12">{severity}</span>'
+                else:
+                    severity_display = "-"
+
+                # Age color coding
+                if age_days > 60:
+                    age_color = "#d73027"  # Red for old bugs
+                elif age_days > 30:
+                    age_color = "#e67e22"  # Orange for medium age
+                else:
+                    age_color = "#666"
+
+                row_bg = "#fff" if idx % 2 == 0 else "#f9f9f9"
+                c = "padding:6px;border-bottom:1px solid #eee"
+                table_html += f"""<tr style="background-color:{row_bg}"><td style="{c}"><a href="{issue_url}" style="color:#3498db;text-decoration:none;font-weight:bold">{key}</a></td><td style="{c}">{summary}</td><td style="{c};text-align:center">{source_display}</td><td style="{c};text-align:center">{severity_display}</td><td style="{c};color:{age_color}">{created_str} ({age_days}d)</td><td style="{c}">{assignee_name}</td></tr>"""
+
+            table_html += """</tbody></table>"""
+            html.append(table_html)
+
+            if len(customer_bugs_new) > 15:
+                html.append(f'<p style="margin-left:20px;color:#999;font-style:italic">... and {len(customer_bugs_new) - 15} more untriaged customer bugs</p>')
+        else:
+            html.append('<p style="margin-left:20px;color:#28a745">✅ No untriaged customer bugs in NEW status</p>')
+
+        # Section 6: Key Progress (TABLE FORMAT)
         progress = self.get_key_progress(team_value)
         progress_groups = self.group_issues_by_description(progress)
-        html.append(f'<h3 style="color: #2166ac;">📈 Key Progress: {len(progress_groups)}</h3>')
+        html.append(f'<h3 style="color:#1976d2">📈 Key Progress: {len(progress_groups)}</h3>')
         if progress_groups:
-            html.append('<ul style="margin-left: 20px;">')
-            for group_key, group_data in list(progress_groups.items())[:15]:
-                # Issue header
-                if group_data["is_cve"]:
-                    html.append(f'<li><strong style="color: #2166ac;">{group_data["cve_id"]}</strong>: {group_data["description"]}<br>')
-                else:
-                    html.append(f'<li>{group_data["description"]}<br>')
-
-                # Show assignees
-                if group_data['assignees']:
-                    assignees_list = ", ".join(sorted(group_data['assignees']))
-                    html.append(f'<span style="color: #666; font-size: 0.9em;">Assignee(s): {assignees_list}</span><br>')
-
-                # Show all versions/instances as clickable links with status
-                version_links = []
-                for issue_data in group_data["issues"]:
-                    issue_url = f"{self.jira.url}/browse/{issue_data['key']}"
-                    display_text = issue_data['version'] if issue_data['version'] else issue_data['key']
-                    # Show status in the tooltip
-                    version_links.append(
-                        f'<a href="{issue_url}" style="color: #3498db; text-decoration: none;" title="{issue_data["status"]} - {issue_data["assignee"]}">{display_text}</a>'
-                    )
-                html.append(f'<span style="color: #666; font-size: 0.85em;">Progress: {", ".join(version_links)}</span>')
-                html.append('</li>')
-
+            html.append(self.generate_table_format(progress_groups, section_type="progress"))
             if len(progress_groups) > 15:
-                html.append(f'<li><em>... and {len(progress_groups) - 15} more items</em></li>')
-            html.append('</ul>')
+                html.append(f'<p style="margin-left: 20px; color: #999; font-style: italic;">... and {len(progress_groups) - 15} more items not shown</p>')
         else:
             html.append('<p style="margin-left: 20px; color: #666;">No key progress items</p>')
 
-        # Section 7: Tasks (updated in last 24h, grouped)
+        # Section 7: Tasks (TABLE FORMAT)
         tasks = self.get_tasks(team_value)
         task_groups = self.group_issues_by_description(tasks)
-        html.append(f'<h3 style="color: #6c757d;">📋 Tasks (Updated Last 24h): {len(task_groups)}</h3>')
+        html.append(f'<h3 style="color:#616161">📋 Tasks (Updated Last 24h): {len(task_groups)}</h3>')
         if task_groups:
-            html.append('<ul style="margin-left: 20px;">')
-            for group_key, group_data in list(task_groups.items())[:20]:  # Show more tasks
-                # Task header
-                if group_data["is_cve"]:
-                    html.append(f'<li><strong style="color: #6c757d;">{group_data["cve_id"]}</strong>: {group_data["description"]}<br>')
-                else:
-                    html.append(f'<li>{group_data["description"]}<br>')
-
-                # Show assignees
-                if group_data['assignees']:
-                    assignees_list = ", ".join(sorted(group_data['assignees']))
-                    html.append(f'<span style="color: #666; font-size: 0.9em;">Assignee(s): {assignees_list}</span><br>')
-
-                # Show all versions/instances as clickable links
-                version_links = []
-                for issue_data in group_data["issues"]:
-                    issue_url = f"{self.jira.url}/browse/{issue_data['key']}"
-                    display_text = issue_data['version'] if issue_data['version'] else issue_data['key']
-                    version_links.append(
-                        f'<a href="{issue_url}" style="color: #3498db; text-decoration: none;" title="{issue_data["status"]} - {issue_data["assignee"]}">{display_text}</a>'
-                    )
-                html.append(f'<span style="color: #666; font-size: 0.85em;">Tasks: {", ".join(version_links)}</span>')
-                html.append('</li>')
-
+            html.append(self.generate_table_format(task_groups, section_type="tasks"))
             if len(task_groups) > 20:
-                html.append(f'<li><em>... and {len(task_groups) - 20} more task groups</em></li>')
-            html.append('</ul>')
+                html.append(f'<p style="margin-left: 20px; color: #999; font-style: italic;">... and {len(task_groups) - 20} more task groups not shown</p>')
         else:
             html.append('<p style="margin-left: 20px; color: #666;">No active tasks</p>')
 
@@ -746,23 +834,7 @@ class POReportGenerator:
         """Generate complete HTML report for all teams"""
         today = datetime.now().strftime("%B %d, %Y")
 
-        html = [f"""
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <style>
-        body {{ font-family: Arial, sans-serif; line-height: 1.6; color: #333; max-width: 900px; margin: 0 auto; padding: 20px; }}
-        h1 {{ color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 10px; }}
-        a {{ color: #3498db; text-decoration: none; }}
-        a:hover {{ text-decoration: underline; }}
-    </style>
-</head>
-<body>
-<p style="color: #666; font-size: 0.95em;">
-Dashboard: <a href="https://redhat.atlassian.net/jira/dashboards/25063">FS Team Dashboard</a>
-</p>
-"""]
+        html = [f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><style>body{{font-family:Arial,sans-serif;line-height:1.6;color:#333;max-width:900px;margin:0 auto;padding:20px}}h1{{color:#2c3e50;border-bottom:3px solid #3498db;padding-bottom:10px}}a{{color:#3498db;text-decoration:none}}a:hover{{text-decoration:underline}}</style></head><body><p style="color:#666;font-size:0.95em">Dashboard: <a href="https://redhat.atlassian.net/jira/dashboards/25063">FS Team Dashboard</a></p>"""]
 
         # Generate section for each team
         for team_name, team_value in self.config["teams"].items():
@@ -776,18 +848,7 @@ Dashboard: <a href="https://redhat.atlassian.net/jira/dashboards/25063">FS Team 
 </div>
 """)
 
-        html.append("""
-<hr style="margin-top: 30px; border: none; border-top: 1px solid #ddd;">
-<p style="color: #333; font-size: 0.95em; margin-top: 20px;">
-Regards,<br>
-Anand Reddy
-</p>
-<p style="color: #999; font-size: 0.85em; text-align: center; margin-top: 20px;">
-Generated by Daily PO Report System
-</p>
-</body>
-</html>
-""")
+        html.append("""<hr style="margin-top:30px;border:none;border-top:1px solid #ddd"><p style="color:#333;font-size:0.95em;margin-top:20px">Regards,<br>Anand Reddy</p><p style="color:#999;font-size:0.85em;text-align:center;margin-top:20px">Generated by Daily PO Report System</p></body></html>""")
 
         return '\n'.join(html)
 
