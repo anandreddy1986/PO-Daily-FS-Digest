@@ -30,30 +30,46 @@ class JiraClient:
         self.auth = HTTPBasicAuth(username, api_token)
         self.headers = {"Accept": "application/json"}
 
-    def search_issues(self, jql, fields=None, max_results=50):
-        """Search Jira issues using JQL"""
+    def search_issues(self, jql, fields=None, max_results=500):
+        """Search Jira issues using JQL with automatic cursor-based pagination"""
         endpoint = f"{self.url}/rest/api/3/search/jql"
+        page_size = min(max_results, 100)
+        fields_str = ",".join(fields) if fields else "summary,status,priority,assignee,created,updated,fixVersions"
 
-        params = {
-            "jql": jql,
-            "maxResults": max_results,
-            "fields": ",".join(fields) if fields else "summary,status,priority,assignee,created,updated,fixVersions"
-        }
+        all_issues = []
+        next_page_token = None
 
         try:
-            response = requests.get(endpoint, headers=self.headers, auth=self.auth, params=params)
-            response.raise_for_status()
-            result = response.json()
-            if result is None:
-                return {"issues": [], "total": 0}
-            # /search/jql endpoint doesn't return "total", so add it based on issues count
-            if "total" not in result:
-                result["total"] = len(result.get("issues", []))
-            return result
+            while len(all_issues) < max_results:
+                params = {
+                    "jql": jql,
+                    "maxResults": min(page_size, max_results - len(all_issues)),
+                    "fields": fields_str
+                }
+                if next_page_token:
+                    params["nextPageToken"] = next_page_token
+
+                response = requests.get(endpoint, headers=self.headers, auth=self.auth, params=params)
+                response.raise_for_status()
+                result = response.json()
+                if result is None:
+                    break
+
+                page_issues = result.get("issues", [])
+                if not page_issues:
+                    break
+
+                all_issues.extend(page_issues)
+                next_page_token = result.get("nextPageToken")
+
+                if not next_page_token or len(page_issues) < page_size:
+                    break
+
+            return {"issues": all_issues, "total": len(all_issues)}
         except Exception as e:
             print(f"ERROR in search_issues: {str(e)}")
             print(f"JQL: {jql}")
-            return {"issues": [], "total": 0}
+            return {"issues": all_issues if all_issues else [], "total": len(all_issues)}
 
 
 class POReportGenerator:
@@ -88,64 +104,63 @@ class POReportGenerator:
     def get_new_issues(self, team_value):
         """Get issues created in last 24 hours for a team (Bug, Vulnerability, Story only)"""
         jql = f'project = {self.config["jira_project"]} AND AssignedTeam = {team_value} AND type in (Bug, Vulnerability, Story) AND created >= -24h'
-        result = self.jira.search_issues(jql, max_results=100)
+        result = self.jira.search_issues(jql, max_results=500)
         return result.get("issues", [])
 
     def get_closed_issues(self, team_value):
         """Get issues closed in last 24 hours for a team (Bug, Vulnerability, Story only)"""
         jql = f'project = {self.config["jira_project"]} AND AssignedTeam = {team_value} AND type in (Bug, Vulnerability, Story) AND status changed to (Closed, Done, Resolved) DURING (-24h, now())'
-        result = self.jira.search_issues(jql, max_results=100)
+        result = self.jira.search_issues(jql, max_results=500)
         return result.get("issues", [])
 
     def get_weekend_new_issues(self, team_value):
         """Get issues created over the weekend (Friday-Sunday, i.e., 24h-72h ago)"""
         jql = f'project = {self.config["jira_project"]} AND AssignedTeam = {team_value} AND type in (Bug, Vulnerability, Story) AND created >= -72h AND created < -24h'
-        result = self.jira.search_issues(jql, max_results=100)
+        result = self.jira.search_issues(jql, max_results=500)
         return result.get("issues", [])
 
     def get_weekend_closed_issues(self, team_value):
         """Get issues closed over the weekend (Friday-Sunday, i.e., 24h-72h ago)"""
         jql = f'project = {self.config["jira_project"]} AND AssignedTeam = {team_value} AND type in (Bug, Vulnerability, Story) AND status changed to (Closed, Done, Resolved) DURING (-72h, -24h)'
-        result = self.jira.search_issues(jql, max_results=100)
+        result = self.jira.search_issues(jql, max_results=500)
         return result.get("issues", [])
 
     def get_cve_issues(self, team_value):
         """Get active CVE/security issues for a team
 
-        Note: Gets all Bug/Vulnerability/Story issues and filters for CVEs in Python
-        due to Jira text search limitations.
+        Uses two queries to ensure complete coverage:
+        1. All Vulnerability/Weakness type issues (catches embargoed items)
+        2. Bug/Story issues with CVE in summary (catches CVE-tracked bugs)
         """
         import re
 
-        # Get all Bug/Vulnerability/Story issues for the team
-        jql = f'''project = {self.config["jira_project"]} AND AssignedTeam = {team_value} AND
-                 type in (Bug, Vulnerability, Story) AND
+        fields = ["summary", "status", "priority", "assignee", "created", "updated", "issuetype", self.custom_fields["severity"], self.custom_fields["cvss_score"], "labels", "duedate", "fixVersions"]
+
+        # Query 1: All Vulnerability/Weakness type issues (includes embargoed CVEs)
+        jql_vuln = f'''project = {self.config["jira_project"]} AND AssignedTeam = {team_value} AND
+                 type in (Vulnerability, Weakness) AND
                  status not in (Closed, Done, Resolved, "Release Pending")'''
+        result_vuln = self.jira.search_issues(jql_vuln, fields=fields, max_results=500)
 
-        fields = ["summary", "status", "priority", "assignee", "created", "updated", "issuetype", self.custom_fields["severity"], "labels", "duedate", "fixVersions"]
-        result = self.jira.search_issues(jql, fields=fields, max_results=200)
+        # Query 2: Bug/Story issues that have CVE in summary (CVE-tracked bugs)
+        jql_bugs = f'''project = {self.config["jira_project"]} AND AssignedTeam = {team_value} AND
+                 type in (Bug, Story) AND
+                 summary ~ "CVE-" AND
+                 status not in (Closed, Done, Resolved, "Release Pending")'''
+        result_bugs = self.jira.search_issues(jql_bugs, fields=fields, max_results=500)
 
-        # Filter for CVE issues in Python
+        # Combine results, dedup by issue key
+        seen_keys = set()
         cve_issues = []
-        for issue in result.get("issues", []):
-            is_cve = False
 
-            # Check 1: Issue type is Vulnerability or Weakness
-            if issue["fields"]["issuetype"]["name"] in ["Vulnerability", "Weakness"]:
-                is_cve = True
+        for issue in result_vuln.get("issues", []):
+            if issue["key"] not in seen_keys:
+                seen_keys.add(issue["key"])
+                cve_issues.append(issue)
 
-            # Check 2: Summary contains CVE pattern (CVE-YYYY-XXXXX)
-            if re.search(r'CVE-\d{4}-\d+', issue["fields"]["summary"], re.IGNORECASE):
-                is_cve = True
-
-            # Check 3: Labels contain CVE pattern
-            labels = issue["fields"].get("labels", [])
-            for label in labels:
-                if re.match(r'CVE-\d{4}-\d+', label, re.IGNORECASE):
-                    is_cve = True
-                    break
-
-            if is_cve:
+        for issue in result_bugs.get("issues", []):
+            if issue["key"] not in seen_keys:
+                seen_keys.add(issue["key"])
                 cve_issues.append(issue)
 
         return cve_issues
@@ -157,7 +172,7 @@ class POReportGenerator:
                  status not in (Closed, Done, Resolved, "Release Pending")'''
 
         fields = ["summary", "status", "priority", "assignee", "updated", "labels", "fixVersions"]
-        result = self.jira.search_issues(jql, fields=fields, max_results=100)
+        result = self.jira.search_issues(jql, fields=fields, max_results=500)
 
         return result.get("issues", [])
 
@@ -167,7 +182,7 @@ class POReportGenerator:
                  status = Integration AND "Fixed in Build" is not EMPTY'''
 
         fields = ["summary", "status", "priority", "assignee", "updated", "fixVersions"]
-        result = self.jira.search_issues(jql, fields=fields, max_results=100)
+        result = self.jira.search_issues(jql, fields=fields, max_results=500)
 
         return result.get("issues", [])
 
@@ -179,7 +194,7 @@ class POReportGenerator:
                  status not in (Closed, Done, Resolved, "Release Pending")'''
 
         fields = ["summary", "status", "priority", "assignee", "updated", self.custom_fields["sfdc_cases_counter"], self.custom_fields["customer_impact"], "labels", "fixVersions"]
-        result = self.jira.search_issues(jql, fields=fields, max_results=100)
+        result = self.jira.search_issues(jql, fields=fields, max_results=500)
 
         return result.get("issues", [])
 
@@ -201,7 +216,7 @@ class POReportGenerator:
                   self.custom_fields["customer_impact"],
                   self.custom_fields["severity"],
                   "fixVersions"]
-        result = self.jira.search_issues(jql, fields=fields, max_results=100)
+        result = self.jira.search_issues(jql, fields=fields, max_results=500)
 
         # Filter for customer bugs in Python
         customer_bugs = []
@@ -274,9 +289,90 @@ class POReportGenerator:
                  "Preliminary Testing" is EMPTY'''
 
         fields = ["summary", "status", "priority", "assignee", "updated", self.custom_fields["testable_builds"], "fixVersions"]
-        result = self.jira.search_issues(jql, fields=fields, max_results=100)
+        result = self.jira.search_issues(jql, fields=fields, max_results=500)
 
         return result.get("issues", [])
+
+    def get_internal_bugs_awaiting_triage(self, team_value):
+        """Get non-customer, non-CVE bugs in NEW status that have been untriaged for 7+ days"""
+        import re as _re
+
+        jql = f'''project = {self.config["jira_project"]} AND AssignedTeam = {team_value} AND
+                 type in (Bug, Vulnerability, Story) AND
+                 status = "New" AND
+                 created <= -7d'''
+
+        fields = ["summary", "status", "priority", "assignee", "created", "updated", "reporter",
+                  "issuetype", "labels",
+                  self.custom_fields["sfdc_cases_counter"],
+                  self.custom_fields["sfdc_cases_links"],
+                  self.custom_fields["sfdc_cases_open"],
+                  self.custom_fields["customer_impact"],
+                  self.custom_fields["severity"],
+                  "fixVersions"]
+        result = self.jira.search_issues(jql, fields=fields, max_results=500)
+
+        non_customer_bugs = []
+        for issue in result.get("issues", []):
+            # Exclude CVE/security issues (already shown in CVE section)
+            is_cve = False
+            if issue["fields"]["issuetype"]["name"] in ["Vulnerability", "Weakness"]:
+                is_cve = True
+            if _re.search(r'CVE-\d{4}-\d+', issue["fields"]["summary"], _re.IGNORECASE):
+                is_cve = True
+            labels = issue["fields"].get("labels", [])
+            for label in labels:
+                if _re.match(r'CVE-\d{4}-\d+', label, _re.IGNORECASE):
+                    is_cve = True
+                    break
+            if is_cve:
+                continue
+            is_customer_bug = False
+
+            reporter = issue["fields"].get("reporter", {})
+            if reporter and reporter.get("displayName") == "bugproxy bugproxy":
+                is_customer_bug = True
+
+            customer_impact = issue["fields"].get(self.custom_fields["customer_impact"])
+            if customer_impact:
+                impact_value = customer_impact.get("value") if isinstance(customer_impact, dict) else customer_impact
+                if isinstance(impact_value, list):
+                    values = []
+                    for item in impact_value:
+                        if isinstance(item, dict) and "value" in item:
+                            values.append(item["value"])
+                        elif isinstance(item, str):
+                            values.append(item)
+                    if not (len(values) == 1 and values[0] == "Customer Facing"):
+                        is_customer_bug = True
+                elif impact_value and impact_value != "Customer Facing":
+                    is_customer_bug = True
+
+            sfdc_counter = issue["fields"].get(self.custom_fields["sfdc_cases_counter"])
+            if sfdc_counter:
+                if isinstance(sfdc_counter, str):
+                    is_customer_bug = True
+                elif isinstance(sfdc_counter, dict) and sfdc_counter.get("value"):
+                    is_customer_bug = True
+
+            sfdc_links = issue["fields"].get(self.custom_fields["sfdc_cases_links"])
+            if sfdc_links:
+                if isinstance(sfdc_links, str):
+                    is_customer_bug = True
+                elif isinstance(sfdc_links, dict) and sfdc_links.get("value"):
+                    is_customer_bug = True
+
+            sfdc_open = issue["fields"].get(self.custom_fields["sfdc_cases_open"])
+            if sfdc_open:
+                if isinstance(sfdc_open, str):
+                    is_customer_bug = True
+                elif isinstance(sfdc_open, dict) and sfdc_open.get("value"):
+                    is_customer_bug = True
+
+            if not is_customer_bug:
+                non_customer_bugs.append(issue)
+
+        return non_customer_bugs
 
     def get_key_progress(self, team_value):
         """Get recently updated high-priority items showing progress (Bug, Vulnerability, Story only)"""
@@ -287,7 +383,7 @@ class POReportGenerator:
                  status in ("In Progress", "In Review", "Testing", "QE Review") AND
                  status not in ("Release Pending")'''
 
-        result = self.jira.search_issues(jql, max_results=50)
+        result = self.jira.search_issues(jql, max_results=500)
         return result.get("issues", [])
 
     def get_tasks(self, team_value):
@@ -298,7 +394,7 @@ class POReportGenerator:
                  status not in (Closed, Done, Resolved, "Release Pending") AND
                  summary !~ "[KWF:"'''
 
-        result = self.jira.search_issues(jql, max_results=100)
+        result = self.jira.search_issues(jql, max_results=500)
         return result.get("issues", [])
 
     def group_issues_by_description(self, issues, include_severity=False):
@@ -336,7 +432,7 @@ class POReportGenerator:
             else:
                 # Non-CVE: group by description without version tag
                 description = re.sub(r'\s*\[rhel-[\d.z]+\]', '', clean_summary).strip()
-                group_key = f"DESC-{description[:50]}"  # Use first 50 chars as key
+                group_key = f"DESC-{description[:200]}"
 
             if group_key not in grouped:
                 grouped[group_key] = {
@@ -351,17 +447,39 @@ class POReportGenerator:
                     severity_field = issue["fields"].get(self.custom_fields["severity"])
                     grouped[group_key]["severity"] = severity_field.get("value", "N/A") if severity_field else "N/A"
 
+            # Extract CVSS score if available
+            cvss_field = issue["fields"].get(self.custom_fields.get("cvss_score", ""), None)
+            cvss_score = None
+            if cvss_field:
+                if isinstance(cvss_field, (int, float)):
+                    cvss_score = cvss_field
+                elif isinstance(cvss_field, dict):
+                    cvss_val = cvss_field.get("value") or cvss_field.get("score")
+                    if cvss_val:
+                        try:
+                            cvss_score = float(str(cvss_val).split()[0])
+                        except (ValueError, TypeError):
+                            pass
+                elif isinstance(cvss_field, str):
+                    try:
+                        cvss_score = float(cvss_field.split()[0])
+                    except (ValueError, TypeError):
+                        pass
+
             grouped[group_key]["issues"].append({
                 "key": issue["key"],
                 "version": version,
                 "status": issue["fields"]["status"]["name"],
                 "assignee": issue["fields"]["assignee"]["displayName"] if issue["fields"].get("assignee") else "Unassigned",
                 "priority": issue["fields"]["priority"]["name"] if issue["fields"].get("priority") else "Undefined",
-                "duedate": issue["fields"].get("duedate")
+                "duedate": issue["fields"].get("duedate"),
+                "cvss_score": cvss_score
             })
 
             if issue["fields"].get("assignee"):
-                grouped[group_key]["assignees"].add(issue["fields"]["assignee"]["displayName"])
+                assignee_name = issue["fields"]["assignee"]["displayName"]
+                if not self._is_filtered_assignee(assignee_name):
+                    grouped[group_key]["assignees"].add(assignee_name)
 
         return grouped
 
@@ -384,7 +502,7 @@ class POReportGenerator:
         th_c = "padding:2px;border-bottom:2px solid #ddd;text-align:center;background-color:#f0f0f0"
 
         if section_type == "cve":
-            table_style = f"""<table style="width:100%;border-collapse:collapse;border-spacing:0;margin-top:3px;font-size:0.9em"><thead><tr><th style="{th}">CVE</th><th style="{th}">Description</th><th style="{th}">Sev</th><th style="{th}">Assignee</th><th style="{th_c}">#</th><th style="{th}">Versions</th><th style="{th}">Due</th></tr></thead><tbody>"""
+            table_style = f"""<table style="width:100%;border-collapse:collapse;border-spacing:0;margin-top:3px;font-size:0.9em"><thead><tr><th style="{th}">CVE</th><th style="{th}">Description</th><th style="{th_c}">Phase</th><th style="{th}">Assignee</th><th style="{th_c}">#</th><th style="{th}">Versions/Due/CVSS</th></tr></thead><tbody>"""
         elif section_type in ["new", "closed"]:
             table_style = f"""<table style="width:100%;border-collapse:collapse;border-spacing:0;margin-top:3px;font-size:0.9em"><thead><tr><th style="{th}">Bug/CVE</th><th style="{th}">Description</th><th style="{th}">Assignee</th><th style="{th}">Versions</th></tr></thead><tbody>"""
         else:
@@ -417,22 +535,18 @@ class POReportGenerator:
 
             # Build version links
             version_links = []
-            for issue_data in group_data["issues"][:5]:  # Show first 5 versions
+            for issue_data in group_data["issues"]:
                 issue_url = f"{self.jira.url}/browse/{issue_data['key']}"
                 display_text = issue_data['version'] if issue_data['version'] else issue_data['key']
                 version_links.append(
                     f'<a href="{issue_url}" style="color:#3498db;text-decoration:none" title="{issue_data["status"]} - {issue_data["assignee"]}">{display_text}</a>'
                 )
 
-            if num_versions > 5:
-                version_links.append(f'<span style="color:#999">+{num_versions - 5}</span>')
-
             versions_str = ", ".join(version_links)
 
             # CVE specific columns
             if section_type == "cve":
                 cve_id = group_data.get("cve_id", "")
-                severity = group_data.get("severity", "N/A")
 
                 # Get first issue key for CVE link
                 first_issue_key = group_data['issues'][0]['key'] if group_data['issues'] else ""
@@ -444,43 +558,51 @@ class POReportGenerator:
                 else:
                     cve_display = f'<a href="{first_issue_url}" style="color:#666;text-decoration:none;font-weight:bold">Non-CVE</a>'
 
-                # Get earliest due date
-                due_dates = [issue.get('duedate') for issue in group_data['issues'] if issue.get('duedate')]
-                if due_dates:
-                    earliest_due = min(due_dates)
+                # Phase (status) display with color coding
+                first_status = group_data['issues'][0]['status'] if group_data['issues'] else "New"
+                phase_colors = {
+                    "New": ("background:#dfe1e6;color:#44546f", "New"),
+                    "In Progress": ("background:#deebff;color:#0747a6", "In Prog"),
+                    "Planning": ("background:#eae6ff;color:#403294", "Plan"),
+                    "Integration": ("background:#e3fcef;color:#006644", "Integr"),
+                }
+                phase_style, phase_text = phase_colors.get(first_status, ("background:#dfe1e6;color:#44546f", first_status[:6]))
+                phase_display = f'<span style="{phase_style};padding:1px 5px;border-radius:3px;font-size:0.8em;font-weight:bold;white-space:nowrap">{phase_text}</span>'
 
-                    # Check if overdue
-                    from datetime import datetime
-                    try:
-                        due_dt = datetime.strptime(earliest_due, "%Y-%m-%d")
-                        now_dt = datetime.now()
-                        is_overdue = due_dt < now_dt
+                # Build combined Versions/Due/CVSS column
+                version_due_parts = []
+                for issue_data in group_data["issues"]:
+                    issue_url = f"{self.jira.url}/browse/{issue_data['key']}"
+                    display_text = issue_data['version'] if issue_data['version'] else issue_data['key']
+                    version_link = f'<a href="{issue_url}" style="color:#3498db;text-decoration:none" title="{issue_data["status"]} - {issue_data["assignee"]}">{display_text}</a>'
 
+                    # Add due date and CVSS inline
+                    due_cvss_parts = []
+                    if issue_data.get('duedate'):
+                        try:
+                            due_dt = datetime.strptime(issue_data['duedate'], "%Y-%m-%d")
+                            due_str = f"{due_dt.month}/{due_dt.day}"
+                            if due_dt < datetime.now():
+                                due_str += "!"
+                            due_cvss_parts.append(due_str)
+                        except:
+                            pass
+                    if issue_data.get('cvss_score'):
+                        due_cvss_parts.append(str(issue_data['cvss_score']))
+
+                    if due_cvss_parts:
+                        is_overdue = issue_data.get('duedate') and datetime.strptime(issue_data['duedate'], "%Y-%m-%d") < datetime.now()
                         if is_overdue:
-                            due_display = f'<span style="color:#d73027;font-weight:bold">{earliest_due} ⚠️</span>'
+                            version_due_parts.append(f'{version_link}<span style="color:#d73027;font-weight:bold">({", ".join(due_cvss_parts)})</span>')
                         else:
-                            days_left = (due_dt - now_dt).days
-                            if days_left <= 7:
-                                due_display = f'<span style="color:#e67e22;font-weight:bold">{earliest_due} ({days_left}d)</span>'
-                            else:
-                                due_display = earliest_due
-                    except:
-                        due_display = earliest_due
-                else:
-                    due_display = "-"
+                            version_due_parts.append(f'{version_link}<span style="color:#888">({", ".join(due_cvss_parts)})</span>')
+                    else:
+                        version_due_parts.append(version_link)
 
-                # Severity color coding (Phase 3: shorter text)
-                if severity == "Critical":
-                    severity_display = f'<span style="color:#d73027;font-weight:bold">Crit</span>'
-                elif severity == "Important":
-                    severity_display = f'<span style="color:#e67e22;font-weight:bold">Imp</span>'
-                elif severity == "Moderate":
-                    severity_display = f'<span style="color:#f39c12">Mod</span>'
-                else:
-                    severity_display = "-"
+                versions_due_str = ", ".join(version_due_parts)
 
                 row_style = f'background-color:{"#fff" if idx % 2 == 0 else "#f9f9f9"}'
-                html_rows.append(f"""<tr style="{row_style}"><td style="padding:2px;border-bottom:1px solid #eee">{cve_display}</td><td style="padding:2px;border-bottom:1px solid #eee">{description}</td><td style="padding:2px;border-bottom:1px solid #eee">{severity_display}</td><td style="padding:2px;border-bottom:1px solid #eee">{assignees_list}</td><td style="padding:2px;border-bottom:1px solid #eee;text-align:center">{num_versions}</td><td style="padding:2px;border-bottom:1px solid #eee;font-size:0.9em">{versions_str}</td><td style="padding:2px;border-bottom:1px solid #eee">{due_display}</td></tr>""")
+                html_rows.append(f"""<tr style="{row_style}"><td style="padding:2px;border-bottom:1px solid #eee">{cve_display}</td><td style="padding:2px;border-bottom:1px solid #eee">{description}</td><td style="padding:2px;border-bottom:1px solid #eee;text-align:center">{phase_display}</td><td style="padding:2px;border-bottom:1px solid #eee">{assignees_list}</td><td style="padding:2px;border-bottom:1px solid #eee;text-align:center">{num_versions}</td><td style="padding:2px;border-bottom:1px solid #eee;font-size:0.9em">{versions_due_str}</td></tr>""")
             else:
                 # Non-CVE sections - show actual issue key or CVE ID
                 first_issue_key = group_data['issues'][0]['key'] if group_data['issues'] else ""
@@ -554,10 +676,30 @@ class POReportGenerator:
         else:
             return f"{diff.seconds // 60}m ago"
 
+    FILTERED_ASSIGNEES = {"kernel se", "kernel_se"}
+
+    def _is_filtered_assignee(self, name):
+        """Check if assignee should be filtered out (e.g., kernel SE)"""
+        if not name:
+            return False
+        return name.strip().lower() in self.FILTERED_ASSIGNEES
+
+    def _filter_out_filtered_assignees(self, issues):
+        """Remove issues whose sole assignee is a filtered assignee (e.g., kernel SE)"""
+        return [
+            issue for issue in issues
+            if not self._is_filtered_assignee(
+                issue["fields"].get("assignee", {}).get("displayName", "") if issue["fields"].get("assignee") else ""
+            )
+        ]
+
     def _shorten_name(self, full_name):
         """Shorten name from 'FirstName LastName' to 'F. LastName'"""
         if not full_name or full_name == "Unassigned":
             return full_name
+
+        if self._is_filtered_assignee(full_name):
+            return None
 
         parts = full_name.strip().split()
         if len(parts) == 1:
@@ -570,8 +712,8 @@ class POReportGenerator:
         html = [f"""<div style="margin-bottom:40px;border-left:5px solid #2c5aa0;padding:25px;border-radius:8px;background:linear-gradient(to right,#f8f9fa,#ffffff);box-shadow:0 2px 4px rgba(0,0,0,0.1)"><h2>📊 {team_name}</h2>"""]
 
         # Section 1: New & Closed Issues (TABLE FORMAT)
-        new_issues = self.get_new_issues(team_value)
-        closed_issues = self.get_closed_issues(team_value)
+        new_issues = self._filter_out_filtered_assignees(self.get_new_issues(team_value))
+        closed_issues = self._filter_out_filtered_assignees(self.get_closed_issues(team_value))
 
         # New Issues Table
         new_groups = self.group_issues_by_description(new_issues, include_severity=True)
@@ -591,8 +733,8 @@ class POReportGenerator:
 
         # Weekend Catch-Up (only on Mondays)
         if datetime.now().weekday() == 0:  # Monday
-            weekend_new = self.get_weekend_new_issues(team_value)
-            weekend_closed = self.get_weekend_closed_issues(team_value)
+            weekend_new = self._filter_out_filtered_assignees(self.get_weekend_new_issues(team_value))
+            weekend_closed = self._filter_out_filtered_assignees(self.get_weekend_closed_issues(team_value))
 
             html.append('<div style="background-color:#fffbf0;border-left:4px solid #f39c12;padding:15px;margin:20px 0">')
             html.append('<h4 style="color: #e67e22; margin-top: 0;">📅 Weekend (Fri-Sun)</h4>')
@@ -667,56 +809,50 @@ class POReportGenerator:
             html.append('</div>')
 
         # Section 2: CVE Issues (TABLE FORMAT)
-        cve_issues = self.get_cve_issues(team_value)
+        cve_issues = self._filter_out_filtered_assignees(self.get_cve_issues(team_value))
         cve_groups = self.group_cves(cve_issues)
-        html.append(f'<h3 style="color:#c62828">🔒 Active CVEs: {len(cve_groups)}</h3>')
+        total_cve_issues = sum(len(g["issues"]) for g in cve_groups.values())
+        unique_cve_count = len(cve_groups)
+        html.append(f'<h3 style="color:#c62828">🔒 Active CVEs: {total_cve_issues} ({unique_cve_count} unique)</h3>')
         if cve_groups:
             html.append(self.generate_table_format(cve_groups, section_type="cve"))
-            if len(cve_groups) > 15:
-                html.append(f'<p style="margin-left:20px;color:#999;font-style:italic">... and {len(cve_groups) - 15} more</p>')
         else:
             html.append('<p style="margin-left:20px;color:#666">No active CVEs</p>')
 
         # Section 3: Prelim Testing Requested (TABLE FORMAT)
-        prelim_testing = self.get_prelim_testing_requested(team_value)
+        prelim_testing = self._filter_out_filtered_assignees(self.get_prelim_testing_requested(team_value))
         prelim_groups = self.group_issues_by_description(prelim_testing)
         html.append(f'<h3 style="color:#7b1fa2">🧪 Prelim Testing Requested: {len(prelim_groups)}</h3>')
         if prelim_groups:
             html.append(self.generate_table_format(prelim_groups, section_type="prelim"))
-            if len(prelim_groups) > 15:
-                html.append(f'<p style="margin-left:20px;color:#999;font-style:italic">... and {len(prelim_groups) - 15} more</p>')
         else:
             html.append('<p style="margin-left:20px;color:#666">No prelim testing requested</p>')
 
         # Section 4: Integration Testing (TABLE FORMAT)
-        integration_testing = self.get_integration_testing(team_value)
+        integration_testing = self._filter_out_filtered_assignees(self.get_integration_testing(team_value))
         integration_groups = self.group_issues_by_description(integration_testing)
         html.append(f'<h3 style="color:#00897b">🔬 Integration Testing: {len(integration_groups)}</h3>')
         if integration_groups:
             html.append(self.generate_table_format(integration_groups, section_type="integration"))
-            if len(integration_groups) > 15:
-                html.append(f'<p style="margin-left:20px;color:#999;font-style:italic">... and {len(integration_groups) - 15} more</p>')
         else:
             html.append('<p style="margin-left:20px;color:#666">No integration testing issues</p>')
 
         # Section 4.5: Waiting on MR Merge (TABLE FORMAT)
-        waiting_mr = self.get_waiting_on_mr_merge(team_value)
+        waiting_mr = self._filter_out_filtered_assignees(self.get_waiting_on_mr_merge(team_value))
         waiting_mr_groups = self.group_issues_by_description(waiting_mr)
-        html.append(f'<h3 style="color:#f57c00">⏳ Waiting on MR Merge: {len(waiting_mr_groups)}</h3>')
+        html.append(f'<h3 style="color:#f57c00">⏳ MR Attention (review, qe, waiting merge, other blockers): {len(waiting_mr_groups)}</h3>')
         if waiting_mr_groups:
             html.append(self.generate_table_format(waiting_mr_groups, section_type="waiting"))
-            if len(waiting_mr_groups) > 15:
-                html.append(f'<p style="margin-left:20px;color:#999;font-style:italic">... and {len(waiting_mr_groups) - 15} more</p>')
         else:
             html.append('<p style="margin-left:20px;color:#666">No issues waiting on MR merge</p>')
 
         # Section 5: Customer Escalations (TABLE FORMAT)
-        escalations = self.get_customer_escalations(team_value)
+        escalations = self._filter_out_filtered_assignees(self.get_customer_escalations(team_value))
         html.append(f'<h3 style="color:#d73027">🚨 Customer Escalations: {len(escalations)}</h3>')
         if escalations:
             table_html = f"""<table style="width:100%;border-collapse:collapse;border-spacing:0;margin-top:3px;font-size:0.9em"><thead><tr><th style="padding:2px;border-bottom:2px solid #ddd;text-align:left;background-color:#f0f0f0">Issue</th><th style="padding:2px;border-bottom:2px solid #ddd;text-align:left;background-color:#f0f0f0">Summary</th><th style="padding:2px;border-bottom:2px solid #ddd;text-align:center;background-color:#f0f0f0">Pri</th><th style="padding:2px;border-bottom:2px solid #ddd;text-align:left;background-color:#f0f0f0">Assignee</th><th style="padding:2px;border-bottom:2px solid #ddd;text-align:left;background-color:#f0f0f0">Updated</th></tr></thead><tbody>"""
 
-            for idx, issue in enumerate(escalations[:10]):
+            for idx, issue in enumerate(escalations):
                 key = issue["key"]
                 summary = issue["fields"]["summary"]
                 issue_url = f"{self.jira.url}/browse/{key}"
@@ -725,7 +861,8 @@ class POReportGenerator:
                     summary = summary[:97] + "..."
 
                 priority = issue["fields"].get("priority", {}).get("name", "N/A") if issue["fields"].get("priority") else "N/A"
-                assignee = issue["fields"].get("assignee", {}).get("displayName", "Unassigned") if issue["fields"].get("assignee") else "Unassigned"
+                raw_assignee = issue["fields"].get("assignee", {}).get("displayName", "Unassigned") if issue["fields"].get("assignee") else "Unassigned"
+                assignee = "Unassigned" if self._is_filtered_assignee(raw_assignee) else raw_assignee
 
                 updated = issue["fields"].get("updated", "")
                 if updated:
@@ -750,19 +887,17 @@ class POReportGenerator:
             table_html += """</tbody></table>"""
             html.append(table_html)
 
-            if len(escalations) > 10:
-                html.append(f'<p style="margin-left:20px;color:#999;font-style:italic">... and {len(escalations) - 10} more</p>')
         else:
             html.append('<p style="margin-left:20px;color:#666">No customer escalations</p>')
 
         # Section 5.5: Customer Bugs in NEW Status (TABLE FORMAT)
-        customer_bugs_new = self.get_customer_bugs_new(team_value)
-        html.append(f'<h3 style="color:#e74c3c">🆕 Customer Bugs - NEW (Needs Triage): {len(customer_bugs_new)}</h3>')
+        customer_bugs_new = self._filter_out_filtered_assignees(self.get_customer_bugs_new(team_value))
+        html.append(f'<h3 style="color:#e74c3c">🆕 Customer Bugs - (Needs Triage): {len(customer_bugs_new)}</h3>')
         if customer_bugs_new:
-            # Generate table - Priority first, then other columns
-            table_html = f"""<table style="width:100%;border-collapse:collapse;border-spacing:0;margin-top:3px;font-size:0.9em"><thead><tr><th style="padding:2px;border-bottom:2px solid #ddd;text-align:center;background-color:#f0f0f0">Prio</th><th style="padding:2px;border-bottom:2px solid #ddd;text-align:left;background-color:#f0f0f0">Issue</th><th style="padding:2px;border-bottom:2px solid #ddd;text-align:left;background-color:#f0f0f0">Summary</th><th style="padding:2px;border-bottom:2px solid #ddd;text-align:center;background-color:#f0f0f0">Sev</th><th style="padding:2px;border-bottom:2px solid #ddd;text-align:left;background-color:#f0f0f0">Created</th><th style="padding:2px;border-bottom:2px solid #ddd;text-align:left;background-color:#f0f0f0">Last Updated</th><th style="padding:2px;border-bottom:2px solid #ddd;text-align:left;background-color:#f0f0f0">Assignee</th></tr></thead><tbody>"""
+            # Generate table - Priority first, then other columns (with Phase)
+            table_html = f"""<table style="width:100%;border-collapse:collapse;border-spacing:0;margin-top:3px;font-size:0.9em"><thead><tr><th style="padding:2px;border-bottom:2px solid #ddd;text-align:center;background-color:#f0f0f0">Prio</th><th style="padding:2px;border-bottom:2px solid #ddd;text-align:left;background-color:#f0f0f0">Issue</th><th style="padding:2px;border-bottom:2px solid #ddd;text-align:left;background-color:#f0f0f0">Summary</th><th style="padding:2px;border-bottom:2px solid #ddd;text-align:center;background-color:#f0f0f0">Phase</th><th style="padding:2px;border-bottom:2px solid #ddd;text-align:center;background-color:#f0f0f0">Sev</th><th style="padding:2px;border-bottom:2px solid #ddd;text-align:left;background-color:#f0f0f0">Created</th><th style="padding:2px;border-bottom:2px solid #ddd;text-align:left;background-color:#f0f0f0">Last Updated</th><th style="padding:2px;border-bottom:2px solid #ddd;text-align:left;background-color:#f0f0f0">Assignee</th></tr></thead><tbody>"""
 
-            for idx, issue in enumerate(customer_bugs_new[:15]):
+            for idx, issue in enumerate(customer_bugs_new):
                 key = issue["key"]
                 summary = issue["fields"]["summary"]
                 issue_url = f"{self.jira.url}/browse/{key}"
@@ -815,6 +950,8 @@ class POReportGenerator:
                 # Get assignee
                 assignee = issue["fields"].get("assignee")
                 assignee_name = self._shorten_name(assignee.get("displayName") if assignee else "Unassigned")
+                if assignee_name is None:
+                    assignee_name = "Unassigned"
 
                 # Severity display with color
                 if severity == "Critical":
@@ -837,36 +974,116 @@ class POReportGenerator:
                 else:
                     age_color = "#666"
 
+                # Phase (status) display
+                status_name = issue["fields"]["status"]["name"] if issue["fields"].get("status") else "New"
+                phase_colors = {
+                    "New": ("background:#dfe1e6;color:#44546f", "New"),
+                    "In Progress": ("background:#deebff;color:#0747a6", "In Prog"),
+                    "Planning": ("background:#eae6ff;color:#403294", "Plan"),
+                    "Integration": ("background:#e3fcef;color:#006644", "Integr"),
+                }
+                p_style, p_text = phase_colors.get(status_name, ("background:#dfe1e6;color:#44546f", status_name[:6]))
+                phase_badge = f'<span style="{p_style};padding:1px 5px;border-radius:3px;font-size:0.8em;font-weight:bold;white-space:nowrap">{p_text}</span>'
+
                 row_style = f'background-color:{"#fff" if idx % 2 == 0 else "#f9f9f9"}'
-                table_html += f"""<tr style="{row_style}"><td style="padding:2px;border-bottom:1px solid #eee;text-align:center">{priority_abbrev}</td><td style="padding:2px;border-bottom:1px solid #eee"><a href="{issue_url}" style="color:#3498db;text-decoration:none;font-weight:bold">{key}</a></td><td style="padding:2px;border-bottom:1px solid #eee">{summary}</td><td style="padding:2px;border-bottom:1px solid #eee;text-align:center">{severity_display}</td><td style="padding:2px;border-bottom:1px solid #eee;color:{age_color}">{created_str} ({age_days}d)</td><td style="padding:2px;border-bottom:1px solid #eee">{updated_str}</td><td style="padding:2px;border-bottom:1px solid #eee">{assignee_name}</td></tr>"""
+                table_html += f"""<tr style="{row_style}"><td style="padding:2px;border-bottom:1px solid #eee;text-align:center">{priority_abbrev}</td><td style="padding:2px;border-bottom:1px solid #eee"><a href="{issue_url}" style="color:#3498db;text-decoration:none;font-weight:bold">{key}</a></td><td style="padding:2px;border-bottom:1px solid #eee">{summary}</td><td style="padding:2px;border-bottom:1px solid #eee;text-align:center">{phase_badge}</td><td style="padding:2px;border-bottom:1px solid #eee;text-align:center">{severity_display}</td><td style="padding:2px;border-bottom:1px solid #eee;color:{age_color}">{created_str} ({age_days}d)</td><td style="padding:2px;border-bottom:1px solid #eee">{updated_str}</td><td style="padding:2px;border-bottom:1px solid #eee">{assignee_name}</td></tr>"""
 
             table_html += """</tbody></table>"""
             html.append(table_html)
 
-            if len(customer_bugs_new) > 15:
-                html.append(f'<p style="margin-left:20px;color:#999;font-style:italic">... and {len(customer_bugs_new) - 15} more</p>')
         else:
             html.append('<p style="margin-left:20px;color:#28a745">✅ No untriaged customer bugs</p>')
 
+        # Section 5.6: Internal Bugs - Awaiting Triage (7+ days) (TABLE FORMAT)
+        internal_bugs = self._filter_out_filtered_assignees(self.get_internal_bugs_awaiting_triage(team_value))
+        html.append(f'<h3 style="color:#5c6bc0">📋 Internal Bugs - Awaiting Triage (7+ days): {len(internal_bugs)}</h3>')
+        if internal_bugs:
+            th_style = "padding:2px;border-bottom:2px solid #ddd;text-align:left;background-color:#f0f0f0"
+            th_c_style = "padding:2px;border-bottom:2px solid #ddd;text-align:center;background-color:#f0f0f0"
+            table_html = f"""<table style="width:100%;border-collapse:collapse;border-spacing:0;margin-top:3px;font-size:0.9em"><thead><tr><th style="{th_c_style}">Prio</th><th style="{th_style}">Issue</th><th style="{th_style}">Summary</th><th style="{th_c_style}">Phase</th><th style="{th_c_style}">Sev</th><th style="{th_style}">Age</th><th style="{th_style}">Assignee</th></tr></thead><tbody>"""
+
+            # Sort by age (oldest first)
+            def get_age(issue):
+                created = issue["fields"].get("created", "")
+                if created:
+                    created_dt = datetime.fromisoformat(created.replace('Z', '+00:00'))
+                    return (datetime.now(created_dt.tzinfo) - created_dt).days
+                return 0
+            internal_bugs_sorted = sorted(internal_bugs, key=get_age, reverse=True)
+
+            for idx, issue in enumerate(internal_bugs_sorted):
+                key = issue["key"]
+                summary = issue["fields"]["summary"]
+                issue_url = f"{self.jira.url}/browse/{key}"
+
+                if len(summary) > 100:
+                    summary = summary[:97] + "..."
+
+                priority_field = issue["fields"].get("priority")
+                priority = priority_field.get("name", "-") if priority_field else "-"
+                priority_abbrev = priority[:3] if priority != "-" else "-"
+
+                severity_field = issue["fields"].get(self.custom_fields["severity"])
+                severity = severity_field.get("value", "N/A") if severity_field else "N/A"
+
+                if severity == "Critical":
+                    severity_display = f'<span style="color:#d73027;font-weight:bold">Crit</span>'
+                elif severity == "Important":
+                    severity_display = f'<span style="color:#e67e22;font-weight:bold">Imp</span>'
+                elif severity == "Moderate":
+                    severity_display = f'<span style="color:#f39c12">Mod</span>'
+                else:
+                    severity_display = "-"
+
+                # Phase (status) display
+                status_name = issue["fields"]["status"]["name"] if issue["fields"].get("status") else "New"
+                phase_colors = {
+                    "New": ("background:#dfe1e6;color:#44546f", "New"),
+                    "In Progress": ("background:#deebff;color:#0747a6", "In Prog"),
+                    "Planning": ("background:#eae6ff;color:#403294", "Plan"),
+                    "Integration": ("background:#e3fcef;color:#006644", "Integr"),
+                }
+                p_style, p_text = phase_colors.get(status_name, ("background:#dfe1e6;color:#44546f", status_name[:6]))
+                phase_badge = f'<span style="{p_style};padding:1px 5px;border-radius:3px;font-size:0.8em;font-weight:bold;white-space:nowrap">{p_text}</span>'
+
+                # Age
+                created = issue["fields"].get("created", "")
+                if created:
+                    created_dt = datetime.fromisoformat(created.replace('Z', '+00:00'))
+                    age_days = (datetime.now(created_dt.tzinfo) - created_dt).days
+                else:
+                    age_days = 0
+                age_str = f"{age_days}d"
+
+                # Assignee (shortened, filtered)
+                assignee = issue["fields"].get("assignee")
+                assignee_name = self._shorten_name(assignee.get("displayName") if assignee else "Unassigned")
+                if assignee_name is None:
+                    assignee_name = "Unassigned"
+
+                row_style = f'background-color:{"#fff" if idx % 2 == 0 else "#f9f9f9"}'
+                table_html += f"""<tr style="{row_style}"><td style="padding:2px;border-bottom:1px solid #eee;text-align:center">{priority_abbrev}</td><td style="padding:2px;border-bottom:1px solid #eee"><a href="{issue_url}" style="color:#3498db;text-decoration:none;font-weight:bold">{key}</a></td><td style="padding:2px;border-bottom:1px solid #eee">{summary}</td><td style="padding:2px;border-bottom:1px solid #eee;text-align:center">{phase_badge}</td><td style="padding:2px;border-bottom:1px solid #eee;text-align:center">{severity_display}</td><td style="padding:2px;border-bottom:1px solid #eee">{age_str}</td><td style="padding:2px;border-bottom:1px solid #eee">{assignee_name}</td></tr>"""
+
+            table_html += """</tbody></table>"""
+            html.append(table_html)
+        else:
+            html.append('<p style="margin-left:20px;color:#666">No internal bugs awaiting triage</p>')
+
         # Section 6: Key Progress (TABLE FORMAT)
-        progress = self.get_key_progress(team_value)
+        progress = self._filter_out_filtered_assignees(self.get_key_progress(team_value))
         progress_groups = self.group_issues_by_description(progress)
         html.append(f'<h3 style="color:#1976d2">📈 Key Progress: {len(progress_groups)}</h3>')
         if progress_groups:
             html.append(self.generate_table_format(progress_groups, section_type="progress"))
-            if len(progress_groups) > 15:
-                html.append(f'<p style="margin-left:20px;color:#999;font-style:italic">... and {len(progress_groups) - 15} more</p>')
         else:
             html.append('<p style="margin-left:20px;color:#666">No key progress items</p>')
 
         # Section 7: Tasks (TABLE FORMAT)
-        tasks = self.get_tasks(team_value)
+        tasks = self._filter_out_filtered_assignees(self.get_tasks(team_value))
         task_groups = self.group_issues_by_description(tasks)
         html.append(f'<h3 style="color:#616161">📋 Tasks (Updated Last 24h): {len(task_groups)}</h3>')
         if task_groups:
             html.append(self.generate_table_format(task_groups, section_type="tasks"))
-            if len(task_groups) > 20:
-                html.append(f'<p style="margin-left:20px;color:#999;font-style:italic">... and {len(task_groups) - 20} more</p>')
         else:
             html.append('<p style="margin-left:20px;color:#666">No active tasks</p>')
 
