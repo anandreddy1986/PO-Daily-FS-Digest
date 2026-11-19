@@ -102,26 +102,26 @@ class POReportGenerator:
         )
 
     def get_new_issues(self, team_value):
-        """Get issues created in last 24 hours for a team (Bug, Vulnerability, Story only)"""
-        jql = f'project = {self.config["jira_project"]} AND AssignedTeam = {team_value} AND type in (Bug, Vulnerability, Story) AND created >= -24h'
+        """Get issues created in last 24 hours for a team (Bug, Story only - CVEs shown in CVE section)"""
+        jql = f'project = {self.config["jira_project"]} AND AssignedTeam = {team_value} AND type in (Bug, Story) AND summary !~ "CVE-" AND created >= -24h'
         result = self.jira.search_issues(jql, max_results=500)
         return result.get("issues", [])
 
     def get_closed_issues(self, team_value):
-        """Get issues closed in last 24 hours for a team (Bug, Vulnerability, Story only)"""
-        jql = f'project = {self.config["jira_project"]} AND AssignedTeam = {team_value} AND type in (Bug, Vulnerability, Story) AND status changed to (Closed, Done, Resolved) DURING (-24h, now())'
+        """Get issues closed in last 24 hours for a team (Bug, Story only - CVEs shown in CVE section)"""
+        jql = f'project = {self.config["jira_project"]} AND AssignedTeam = {team_value} AND type in (Bug, Story) AND summary !~ "CVE-" AND status changed to (Closed, Done, Resolved) DURING (-24h, now())'
         result = self.jira.search_issues(jql, max_results=500)
         return result.get("issues", [])
 
     def get_weekend_new_issues(self, team_value):
         """Get issues created over the weekend (Friday-Sunday, i.e., 24h-72h ago)"""
-        jql = f'project = {self.config["jira_project"]} AND AssignedTeam = {team_value} AND type in (Bug, Vulnerability, Story) AND created >= -72h AND created < -24h'
+        jql = f'project = {self.config["jira_project"]} AND AssignedTeam = {team_value} AND type in (Bug, Story) AND summary !~ "CVE-" AND created >= -72h AND created < -24h'
         result = self.jira.search_issues(jql, max_results=500)
         return result.get("issues", [])
 
     def get_weekend_closed_issues(self, team_value):
         """Get issues closed over the weekend (Friday-Sunday, i.e., 24h-72h ago)"""
-        jql = f'project = {self.config["jira_project"]} AND AssignedTeam = {team_value} AND type in (Bug, Vulnerability, Story) AND status changed to (Closed, Done, Resolved) DURING (-72h, -24h)'
+        jql = f'project = {self.config["jira_project"]} AND AssignedTeam = {team_value} AND type in (Bug, Story) AND summary !~ "CVE-" AND status changed to (Closed, Done, Resolved) DURING (-72h, -24h)'
         result = self.jira.search_issues(jql, max_results=500)
         return result.get("issues", [])
 
@@ -139,14 +139,14 @@ class POReportGenerator:
         # Query 1: All Vulnerability/Weakness type issues (includes embargoed CVEs)
         jql_vuln = f'''project = {self.config["jira_project"]} AND AssignedTeam = {team_value} AND
                  type in (Vulnerability, Weakness) AND
-                 status not in (Closed, Done, Resolved, "Release Pending")'''
+                 status not in (Closed, Done, Resolved, "Release Pending", Integration)'''
         result_vuln = self.jira.search_issues(jql_vuln, fields=fields, max_results=500)
 
         # Query 2: Bug/Story issues that have CVE in summary (CVE-tracked bugs)
         jql_bugs = f'''project = {self.config["jira_project"]} AND AssignedTeam = {team_value} AND
                  type in (Bug, Story) AND
                  summary ~ "CVE-" AND
-                 status not in (Closed, Done, Resolved, "Release Pending")'''
+                 status not in (Closed, Done, Resolved, "Release Pending", Integration)'''
         result_bugs = self.jira.search_issues(jql_bugs, fields=fields, max_results=500)
 
         # Combine results, dedup by issue key
@@ -187,10 +187,10 @@ class POReportGenerator:
         return result.get("issues", [])
 
     def get_customer_escalations(self, team_value):
-        """Get customer escalations (Escalation🔥 label OR Customer Impact = Customer Escalated)"""
+        """Get customer escalations (Escalation🔥/escalated label, Customer Escalated, or Priority List linked)"""
         jql = f'''project = {self.config["jira_project"]} AND AssignedTeam = {team_value} AND
-                 type in (Bug, Vulnerability, Story) AND
-                 (labels = "Escalation🔥" OR "Customer Impact" = "Customer Escalated") AND
+                 type in (Bug, Story) AND summary !~ "CVE-" AND
+                 (labels = "Escalation🔥" OR labels = "escalated" OR "Customer Impact" = "Customer Escalated" OR issueLink = RHELPRIO) AND
                  status not in (Closed, Done, Resolved, "Release Pending")'''
 
         fields = ["summary", "status", "priority", "assignee", "updated", self.custom_fields["sfdc_cases_counter"], self.custom_fields["customer_impact"], "labels", "fixVersions"]
@@ -204,9 +204,9 @@ class POReportGenerator:
         Note: SFDC Cases Counter field is encrypted, so JQL cannot query it directly.
         We fetch all NEW bugs and filter in Python based on field presence.
         """
-        # Get all NEW bugs for the team
+        # Get all NEW bugs for the team (CVEs shown separately in CVE section)
         jql = f'''project = {self.config["jira_project"]} AND AssignedTeam = {team_value} AND
-                 type in (Bug, Vulnerability, Story) AND
+                 type in (Bug, Story) AND summary !~ "CVE-" AND
                  status = "New"'''
 
         fields = ["summary", "status", "priority", "assignee", "created", "updated", "reporter",
@@ -275,6 +275,82 @@ class POReportGenerator:
                 elif isinstance(sfdc_open, dict) and sfdc_open.get("value"):
                     is_customer_bug = True
 
+            # Check 6: Reporter is not an FS team member (likely external/customer report)
+            if not is_customer_bug:
+                reporter_id = reporter.get("accountId") if reporter else None
+                if reporter_id and reporter_id not in self._get_fs_team_member_ids():
+                    is_customer_bug = True
+
+            if is_customer_bug:
+                customer_bugs.append(issue)
+
+        return customer_bugs
+
+    def get_customer_bugs_in_flight(self, team_value):
+        """Get customer-related bugs in any active status, excluding CVEs and Closed (SFDC cases, Customer Impact, or bugproxy reported)"""
+        jql = f'''project = {self.config["jira_project"]} AND AssignedTeam = {team_value} AND
+                 type in (Bug, Story) AND
+                 status not in (New, Closed, "Release Pending", "Integration")'''
+
+        fields = ["summary", "status", "priority", "assignee", "created", "updated", "reporter",
+                  self.custom_fields["sfdc_cases_counter"],
+                  self.custom_fields["sfdc_cases_links"],
+                  self.custom_fields["sfdc_cases_open"],
+                  self.custom_fields["customer_impact"],
+                  self.custom_fields["severity"],
+                  "fixVersions"]
+        result = self.jira.search_issues(jql, fields=fields, max_results=500)
+
+        customer_bugs = []
+        for issue in result.get("issues", []):
+            is_customer_bug = False
+
+            reporter = issue["fields"].get("reporter", {})
+            if reporter and reporter.get("displayName") == "bugproxy bugproxy":
+                is_customer_bug = True
+
+            customer_impact = issue["fields"].get(self.custom_fields["customer_impact"])
+            if customer_impact:
+                impact_value = customer_impact.get("value") if isinstance(customer_impact, dict) else customer_impact
+                if isinstance(impact_value, list):
+                    values = []
+                    for item in impact_value:
+                        if isinstance(item, dict) and "value" in item:
+                            values.append(item["value"])
+                        elif isinstance(item, str):
+                            values.append(item)
+                    if not (len(values) == 1 and values[0] == "Customer Facing"):
+                        is_customer_bug = True
+                elif impact_value and impact_value != "Customer Facing":
+                    is_customer_bug = True
+
+            sfdc_counter = issue["fields"].get(self.custom_fields["sfdc_cases_counter"])
+            if sfdc_counter:
+                if isinstance(sfdc_counter, str):
+                    is_customer_bug = True
+                elif isinstance(sfdc_counter, dict) and sfdc_counter.get("value"):
+                    is_customer_bug = True
+
+            sfdc_links = issue["fields"].get(self.custom_fields["sfdc_cases_links"])
+            if sfdc_links:
+                if isinstance(sfdc_links, str):
+                    is_customer_bug = True
+                elif isinstance(sfdc_links, dict) and sfdc_links.get("value"):
+                    is_customer_bug = True
+
+            sfdc_open = issue["fields"].get(self.custom_fields["sfdc_cases_open"])
+            if sfdc_open:
+                if isinstance(sfdc_open, str):
+                    is_customer_bug = True
+                elif isinstance(sfdc_open, dict) and sfdc_open.get("value"):
+                    is_customer_bug = True
+
+            # Check 6: Reporter is not an FS team member (likely external/customer report)
+            if not is_customer_bug:
+                reporter_id = reporter.get("accountId") if reporter else None
+                if reporter_id and reporter_id not in self._get_fs_team_member_ids():
+                    is_customer_bug = True
+
             if is_customer_bug:
                 customer_bugs.append(issue)
 
@@ -294,13 +370,13 @@ class POReportGenerator:
         return result.get("issues", [])
 
     def get_internal_bugs_awaiting_triage(self, team_value):
-        """Get non-customer, non-CVE bugs in NEW status that have been untriaged for 7+ days"""
+        """Get non-customer, non-CVE bugs in NEW status awaiting triage"""
         import re as _re
 
         jql = f'''project = {self.config["jira_project"]} AND AssignedTeam = {team_value} AND
-                 type in (Bug, Vulnerability, Story) AND
+                 type in (Bug, Story) AND summary !~ "CVE-" AND
                  status = "New" AND
-                 created <= -7d'''
+                 created <= -24h'''
 
         fields = ["summary", "status", "priority", "assignee", "created", "updated", "reporter",
                   "issuetype", "labels",
@@ -369,15 +445,21 @@ class POReportGenerator:
                 elif isinstance(sfdc_open, dict) and sfdc_open.get("value"):
                     is_customer_bug = True
 
+            # Also exclude if reporter is not an FS team member (likely external/customer-originated)
+            if not is_customer_bug:
+                reporter_id = reporter.get("accountId") if reporter else None
+                if reporter_id and reporter_id not in self._get_fs_team_member_ids():
+                    is_customer_bug = True
+
             if not is_customer_bug:
                 non_customer_bugs.append(issue)
 
         return non_customer_bugs
 
     def get_key_progress(self, team_value):
-        """Get recently updated high-priority items showing progress (Bug, Vulnerability, Story only)"""
+        """Get recently updated high-priority items showing progress (Bug, Story only - CVEs shown in CVE section)"""
         jql = f'''project = {self.config["jira_project"]} AND AssignedTeam = {team_value} AND
-                 type in (Bug, Vulnerability, Story) AND
+                 type in (Bug, Story) AND summary !~ "CVE-" AND
                  priority in (Blocker, Critical, Major) AND
                  updated >= -24h AND
                  status in ("In Progress", "In Review", "Testing", "QE Review") AND
@@ -578,12 +660,16 @@ class POReportGenerator:
 
                     # Add due date and CVSS inline
                     due_cvss_parts = []
+                    due_urgency = None  # "overdue", "soon", or None
                     if issue_data.get('duedate'):
                         try:
                             due_dt = datetime.strptime(issue_data['duedate'], "%Y-%m-%d")
                             due_str = f"{due_dt.month}/{due_dt.day}"
                             if due_dt < datetime.now():
                                 due_str += "!"
+                                due_urgency = "overdue"
+                            elif due_dt <= datetime.now() + timedelta(days=14):
+                                due_urgency = "soon"
                             due_cvss_parts.append(due_str)
                         except:
                             pass
@@ -591,8 +677,9 @@ class POReportGenerator:
                         due_cvss_parts.append(str(issue_data['cvss_score']))
 
                     if due_cvss_parts:
-                        is_overdue = issue_data.get('duedate') and datetime.strptime(issue_data['duedate'], "%Y-%m-%d") < datetime.now()
-                        if is_overdue:
+                        if due_urgency == "overdue":
+                            version_due_parts.append(f'{version_link}<span style="color:#d73027;font-weight:bold">({", ".join(due_cvss_parts)})</span>')
+                        elif due_urgency == "soon":
                             version_due_parts.append(f'{version_link}<span style="color:#d73027;font-weight:bold">({", ".join(due_cvss_parts)})</span>')
                         else:
                             version_due_parts.append(f'{version_link}<span style="color:#888">({", ".join(due_cvss_parts)})</span>')
@@ -601,7 +688,21 @@ class POReportGenerator:
 
                 versions_due_str = ", ".join(version_due_parts)
 
-                row_style = f'background-color:{"#fff" if idx % 2 == 0 else "#f9f9f9"}'
+                # Check if any issue in this group has an urgent due date
+                row_urgent = False
+                for issue_data_check in group_data["issues"]:
+                    if issue_data_check.get('duedate'):
+                        try:
+                            check_dt = datetime.strptime(issue_data_check['duedate'], "%Y-%m-%d")
+                            if check_dt <= datetime.now() + timedelta(days=14):
+                                row_urgent = True
+                                break
+                        except:
+                            pass
+                if row_urgent:
+                    row_style = 'background-color:#fde8e8'
+                else:
+                    row_style = f'background-color:{"#fff" if idx % 2 == 0 else "#f9f9f9"}'
                 html_rows.append(f"""<tr style="{row_style}"><td style="padding:2px;border-bottom:1px solid #eee">{cve_display}</td><td style="padding:2px;border-bottom:1px solid #eee">{description}</td><td style="padding:2px;border-bottom:1px solid #eee;text-align:center">{phase_display}</td><td style="padding:2px;border-bottom:1px solid #eee">{assignees_list}</td><td style="padding:2px;border-bottom:1px solid #eee;text-align:center">{num_versions}</td><td style="padding:2px;border-bottom:1px solid #eee;font-size:0.9em">{versions_due_str}</td></tr>""")
             else:
                 # Non-CVE sections - show actual issue key or CVE ID
@@ -692,6 +793,26 @@ class POReportGenerator:
                 issue["fields"].get("assignee", {}).get("displayName", "") if issue["fields"].get("assignee") else ""
             )
         ]
+
+    def _get_fs_team_member_ids(self):
+        """Build cached set of account IDs for all FS team members from active issue assignees"""
+        if hasattr(self, '_cached_team_member_ids'):
+            return self._cached_team_member_ids
+
+        team_values = list(self.config.get("teams", {}).values())
+        team_values_str = ", ".join(team_values)
+
+        jql = f'project = {self.config["jira_project"]} AND AssignedTeam in ({team_values_str}) AND assignee is not EMPTY AND status not in (Closed, Done, Resolved)'
+        result = self.jira.search_issues(jql, fields=["assignee"], max_results=500)
+
+        member_ids = set()
+        for issue in result.get("issues", []):
+            assignee = issue["fields"].get("assignee")
+            if assignee and assignee.get("accountId"):
+                member_ids.add(assignee["accountId"])
+
+        self._cached_team_member_ids = member_ids
+        return member_ids
 
     def _shorten_name(self, full_name):
         """Shorten name from 'FirstName LastName' to 'F. LastName'"""
@@ -994,9 +1115,103 @@ class POReportGenerator:
         else:
             html.append('<p style="margin-left:20px;color:#28a745">✅ No untriaged customer bugs</p>')
 
+        # Section 5.55: Customer Bugs In Flight (all non-New statuses) (TABLE FORMAT)
+        customer_bugs_ip = self._filter_out_filtered_assignees(self.get_customer_bugs_in_flight(team_value))
+        html.append(f'<h3 style="color:#2c5aa0">🔧 Customer Bugs - (In Flight): {len(customer_bugs_ip)}</h3>')
+        if customer_bugs_ip:
+            table_html = f"""<table style="width:100%;border-collapse:collapse;border-spacing:0;margin-top:3px;font-size:0.9em"><thead><tr><th style="padding:2px;border-bottom:2px solid #ddd;text-align:center;background-color:#f0f0f0">Prio</th><th style="padding:2px;border-bottom:2px solid #ddd;text-align:left;background-color:#f0f0f0">Issue</th><th style="padding:2px;border-bottom:2px solid #ddd;text-align:left;background-color:#f0f0f0">Summary</th><th style="padding:2px;border-bottom:2px solid #ddd;text-align:center;background-color:#f0f0f0">Status</th><th style="padding:2px;border-bottom:2px solid #ddd;text-align:center;background-color:#f0f0f0">Sev</th><th style="padding:2px;border-bottom:2px solid #ddd;text-align:left;background-color:#f0f0f0">Created</th><th style="padding:2px;border-bottom:2px solid #ddd;text-align:left;background-color:#f0f0f0">Last Updated</th><th style="padding:2px;border-bottom:2px solid #ddd;text-align:left;background-color:#f0f0f0">Assignee</th></tr></thead><tbody>"""
+
+            for idx, issue in enumerate(customer_bugs_ip):
+                key = issue["key"]
+                summary = issue["fields"]["summary"]
+                issue_url = f"{self.jira.url}/browse/{key}"
+
+                if len(summary) > 100:
+                    summary = summary[:97] + "..."
+
+                reporter = issue["fields"].get("reporter", {})
+                reporter_name = reporter.get("displayName", "Unknown") if reporter else "Unknown"
+                is_bugproxy = reporter_name == "bugproxy bugproxy"
+
+                sfdc_cases = issue["fields"].get(self.custom_fields["sfdc_cases_counter"])
+                has_sfdc = False
+                if sfdc_cases:
+                    if isinstance(sfdc_cases, str):
+                        has_sfdc = True
+                    elif isinstance(sfdc_cases, dict) and sfdc_cases.get("value"):
+                        has_sfdc = True
+
+                severity_field = issue["fields"].get(self.custom_fields["severity"])
+                severity = severity_field.get("value", "N/A") if severity_field else "N/A"
+
+                priority_field = issue["fields"].get("priority")
+                priority = priority_field.get("name", "-") if priority_field else "-"
+
+                created = issue["fields"].get("created", "")
+                if created:
+                    created_dt = datetime.fromisoformat(created.replace('Z', '+00:00'))
+                    created_str = created_dt.strftime("%b %d")
+                    age_days = (datetime.now(created_dt.tzinfo) - created_dt).days
+                else:
+                    created_str = "Unknown"
+                    age_days = 0
+
+                updated = issue["fields"].get("updated", "")
+                if updated:
+                    updated_dt = datetime.fromisoformat(updated.replace('Z', '+00:00'))
+                    updated_str = self._time_ago(updated_dt)
+                else:
+                    updated_str = "Unknown"
+
+                assignee = issue["fields"].get("assignee")
+                assignee_name = self._shorten_name(assignee.get("displayName") if assignee else "Unassigned")
+                if assignee_name is None:
+                    assignee_name = "Unassigned"
+
+                if severity == "Critical":
+                    severity_display = f'<span style="color:#d73027;font-weight:bold">Crit</span>'
+                elif severity == "Important":
+                    severity_display = f'<span style="color:#e67e22;font-weight:bold">Imp</span>'
+                elif severity == "Moderate":
+                    severity_display = f'<span style="color:#f39c12">Mod</span>'
+                else:
+                    severity_display = "-"
+
+                priority_abbrev = priority[:3] if priority != "-" else "-"
+
+                status_field = issue["fields"].get("status", {})
+                status_name = status_field.get("name", "Unknown") if status_field else "Unknown"
+                status_colors = {
+                    "In Progress": ("background:#deebff;color:#0747a6", "In Prog"),
+                    "In Review": ("background:#e3fcef;color:#006644", "Review"),
+                    "Testing": ("background:#fff3e0;color:#e65100", "Testing"),
+                    "QE Review": ("background:#f3e5f5;color:#6a1b9a", "QE Rev"),
+                    "Release Pending": ("background:#e8f5e9;color:#2e7d32", "Rel Pend"),
+                    "Closed": ("background:#f0f0f0;color:#666", "Closed"),
+                    "On QA": ("background:#fff8e1;color:#f57f17", "On QA"),
+                }
+                status_style, status_short = status_colors.get(status_name, ("background:#e0e0e0;color:#333", status_name[:8]))
+                status_display = f'<span style="padding:1px 4px;border-radius:3px;font-size:0.85em;{status_style}">{status_short}</span>'
+
+                if age_days > 60:
+                    age_color = "#d73027"
+                elif age_days > 30:
+                    age_color = "#e67e22"
+                else:
+                    age_color = "#666"
+
+                row_style = f'background-color:{"#fff" if idx % 2 == 0 else "#f9f9f9"}'
+                table_html += f"""<tr style="{row_style}"><td style="padding:2px;border-bottom:1px solid #eee;text-align:center">{priority_abbrev}</td><td style="padding:2px;border-bottom:1px solid #eee"><a href="{issue_url}" style="color:#3498db;text-decoration:none;font-weight:bold">{key}</a></td><td style="padding:2px;border-bottom:1px solid #eee">{summary}</td><td style="padding:2px;border-bottom:1px solid #eee;text-align:center">{status_display}</td><td style="padding:2px;border-bottom:1px solid #eee;text-align:center">{severity_display}</td><td style="padding:2px;border-bottom:1px solid #eee;color:{age_color}">{created_str} ({age_days}d)</td><td style="padding:2px;border-bottom:1px solid #eee">{updated_str}</td><td style="padding:2px;border-bottom:1px solid #eee">{assignee_name}</td></tr>"""
+
+            table_html += """</tbody></table>"""
+            html.append(table_html)
+
+        else:
+            html.append('<p style="margin-left:20px;color:#28a745">✅ No customer bugs in flight</p>')
+
         # Section 5.6: Internal Bugs - Awaiting Triage (7+ days) (TABLE FORMAT)
         internal_bugs = self._filter_out_filtered_assignees(self.get_internal_bugs_awaiting_triage(team_value))
-        html.append(f'<h3 style="color:#5c6bc0">📋 Internal Bugs - Awaiting Triage (7+ days): {len(internal_bugs)}</h3>')
+        html.append(f'<h3 style="color:#5c6bc0">📋 Internal Bugs - Awaiting Triage: {len(internal_bugs)}</h3>')
         if internal_bugs:
             th_style = "padding:2px;border-bottom:2px solid #ddd;text-align:left;background-color:#f0f0f0"
             th_c_style = "padding:2px;border-bottom:2px solid #ddd;text-align:center;background-color:#f0f0f0"
@@ -1090,6 +1305,184 @@ class POReportGenerator:
         html.append('</div>')
         return '\n'.join(html)
 
+    def _collect_team_stats(self, team_value):
+        """Collect all health stats for a team (shared by digest email and full report)"""
+        new_issues = self._filter_out_filtered_assignees(self.get_new_issues(team_value))
+        closed_issues = self._filter_out_filtered_assignees(self.get_closed_issues(team_value))
+        new_groups = self.group_issues_by_description(new_issues)
+        closed_groups = self.group_issues_by_description(closed_issues)
+
+        cve_issues = self._filter_out_filtered_assignees(self.get_cve_issues(team_value))
+        cve_groups = self.group_cves(cve_issues)
+        cve_overdue = 0
+        cve_soon = 0
+        for gd in cve_groups.values():
+            worst = "ok"
+            for iss in gd["issues"]:
+                dd = iss.get("duedate")
+                if dd:
+                    try:
+                        days_left = (datetime.strptime(dd, "%Y-%m-%d") - datetime.now()).days
+                        if days_left < 0:
+                            worst = "overdue"
+                        elif days_left <= 14 and worst != "overdue":
+                            worst = "soon"
+                    except Exception:
+                        pass
+            if worst == "overdue":
+                cve_overdue += 1
+            elif worst == "soon":
+                cve_soon += 1
+
+        escalations = self._filter_out_filtered_assignees(self.get_customer_escalations(team_value))
+        cust_triage = self._filter_out_filtered_assignees(self.get_customer_bugs_new(team_value))
+        cust_inflight = self._filter_out_filtered_assignees(self.get_customer_bugs_in_flight(team_value))
+        prelim = self._filter_out_filtered_assignees(self.get_prelim_testing_requested(team_value))
+        prelim_groups = self.group_issues_by_description(prelim)
+        integration = self._filter_out_filtered_assignees(self.get_integration_testing(team_value))
+        integ_groups = self.group_issues_by_description(integration)
+        mr_waiting = self._filter_out_filtered_assignees(self.get_waiting_on_mr_merge(team_value))
+        mr_groups = self.group_issues_by_description(mr_waiting)
+        internal = self._filter_out_filtered_assignees(self.get_internal_bugs_awaiting_triage(team_value))
+        progress = self._filter_out_filtered_assignees(self.get_key_progress(team_value))
+        progress_groups = self.group_issues_by_description(progress)
+
+        return {
+            "new": len(new_groups),
+            "closed": len(closed_groups),
+            "cve": len(cve_groups),
+            "cve_total": sum(len(g["issues"]) for g in cve_groups.values()),
+            "cve_overdue": cve_overdue,
+            "cve_soon": cve_soon,
+            "esc": len(escalations),
+            "cust_triage": len(cust_triage),
+            "cust_inflight": len(cust_inflight),
+            "prelim": len(prelim_groups),
+            "integ": len(integ_groups),
+            "mr": len(mr_groups),
+            "internal": len(internal),
+            "progress": len(progress_groups),
+        }
+
+    def generate_digest_email(self, confluence_page_id="512524957"):
+        """Generate compact health-dashboard email with links to Confluence for details"""
+        today = datetime.now().strftime("%B %d, %Y")
+        is_monday = datetime.now().weekday() == 0
+        confluence_url = f"https://redhat.atlassian.net/wiki/spaces/~622f0f4c8e5b380069e27ce0/pages/{confluence_page_id}"
+
+        all_stats = []
+        for team_name, team_value in self.config["teams"].items():
+            try:
+                stats = self._collect_team_stats(team_value)
+                all_stats.append((team_name, stats))
+            except Exception as e:
+                print(f"  ERROR on {team_name}: {e}")
+                all_stats.append((team_name, {k: 0 for k in [
+                    "new", "closed", "cve", "cve_total", "cve_overdue", "cve_soon",
+                    "esc", "cust_triage", "cust_inflight", "prelim", "integ", "mr", "internal", "progress"
+                ]}))
+
+        # Build the compact email
+        html = [f"""<!DOCTYPE html><html><head><meta charset="UTF-8"></head><body style="font-family:Arial,sans-serif;color:#333;max-width:900px;margin:0 auto;padding:20px">
+<h2 style="color:#2c3e50;margin-bottom:5px">FS Teams Health Dashboard — {today}{"  (Weekend)" if is_monday else ""}</h2>
+<p style="margin:0 0 15px 0;color:#666;font-size:0.9em">
+<a href="https://redhat.atlassian.net/jira/dashboards/25063" style="color:#3498db;text-decoration:none">Jira Dashboard</a>
+&nbsp;|&nbsp;
+<a href="{confluence_url}" style="color:#3498db;text-decoration:none;font-weight:bold">📄 Full Details on Confluence</a>
+</p>"""]
+
+        # Alerts banner
+        alerts = []
+        for team_name, s in all_stats:
+            if s["cve_overdue"] > 0:
+                alerts.append(f"<strong>{team_name}</strong>: {s['cve_overdue']} CVE(s) past SLA")
+            if s["esc"] > 0:
+                alerts.append(f"<strong>{team_name}</strong>: {s['esc']} escalation(s)")
+        if alerts:
+            html.append(f"""<div style="background:#fef3cd;border-left:4px solid #f39c12;padding:10px 15px;margin-bottom:15px;font-size:0.9em">
+<strong>⚠ Attention:</strong> {" &nbsp;|&nbsp; ".join(alerts)}
+</div>""")
+
+        # Health summary table
+        th = 'style="padding:6px 8px;border-bottom:2px solid #ccc;text-align:center;background:#f5f5f5;font-size:0.85em;white-space:nowrap"'
+        th_l = 'style="padding:6px 8px;border-bottom:2px solid #ccc;text-align:left;background:#f5f5f5;font-size:0.85em"'
+
+        html.append(f"""<table style="width:100%;border-collapse:collapse;border-spacing:0;font-size:0.9em">
+<thead><tr>
+<th {th_l}>Team</th>
+<th {th}>📌 New Issues</th>
+<th {th}>✅ Closed</th>
+<th {th}>🔒 Open CVEs</th>
+<th {th}>🚨 Escalations</th>
+<th {th}>🆕 CU Issues In New</th>
+<th {th}>🔧 CU Issues in Flight</th>
+<th {th}>⏳ MR Pending</th>
+<th {th}>📋 Internal Bugs</th>
+</tr></thead><tbody>""")
+
+        for idx, (team_name, s) in enumerate(all_stats):
+            row_bg = "#fff" if idx % 2 == 0 else "#f9f9f9"
+            td = f'style="padding:5px 8px;border-bottom:1px solid #eee;text-align:center;background:{row_bg}"'
+            td_l = f'style="padding:5px 8px;border-bottom:1px solid #eee;text-align:left;background:{row_bg};font-weight:bold"'
+
+            def cell(val, warn_threshold=None, critical_threshold=None, invert=False):
+                if val == 0:
+                    return f'<span style="color:#999">—</span>'
+                color = "#333"
+                if critical_threshold is not None and val >= critical_threshold:
+                    color = "#d73027"
+                elif warn_threshold is not None and val >= warn_threshold:
+                    color = "#e67e22"
+                if invert and val > 0:
+                    color = "#28a745"
+                return f'<span style="color:{color};font-weight:{"bold" if color != "#333" else "normal"}">{val}</span>'
+
+            # CVE cell with overdue/soon indicator
+            if s["cve"] == 0:
+                cve_cell = '<span style="color:#999">—</span>'
+            elif s["cve_overdue"] > 0:
+                cve_cell = f'<span style="color:#d73027;font-weight:bold">{s["cve"]} ({s["cve_overdue"]}🔴)</span>'
+            elif s["cve_soon"] > 0:
+                cve_cell = f'<span style="color:#e67e22;font-weight:bold">{s["cve"]} ({s["cve_soon"]}🟡)</span>'
+            else:
+                cve_cell = f'{s["cve"]}'
+
+            # New/Closed with direction hint
+            new_cell = cell(s["new"])
+            closed_cell = f'<span style="color:#28a745;font-weight:bold">{s["closed"]}</span>' if s["closed"] > 0 else '<span style="color:#999">—</span>'
+
+            html.append(f"""<tr>
+<td {td_l}><a href="{confluence_url}" style="color:#2c5aa0;text-decoration:none">{team_name}</a></td>
+<td {td}>{new_cell}</td>
+<td {td}>{closed_cell}</td>
+<td {td}>{cve_cell}</td>
+<td {td}>{cell(s["esc"], 1, 3)}</td>
+<td {td}>{cell(s["cust_triage"], 3, 6)}</td>
+<td {td}>{cell(s["cust_inflight"])}</td>
+<td {td}>{cell(s["mr"], 3, 6)}</td>
+<td {td}>{cell(s["internal"], 5, 10)}</td>
+</tr>""")
+
+        html.append("</tbody></table>")
+
+        # Totals row
+        totals = {}
+        for key in ["new", "closed", "cve", "cve_overdue", "esc", "cust_triage", "cust_inflight", "mr", "internal"]:
+            totals[key] = sum(s[key] for _, s in all_stats)
+
+        # Footer with CTA
+        html.append(f"""<p style="margin:20px 0 8px 0;text-align:center">
+<a href="{confluence_url}" style="display:inline-block;background:#2c5aa0;color:white;padding:10px 24px;border-radius:5px;text-decoration:none;font-weight:bold;font-size:0.95em">
+📄 View Full Details on Confluence →
+</a>
+</p>
+<hr style="margin-top:20px;border:none;border-top:1px solid #ddd">
+<p style="color:#333;font-size:0.95em;margin-top:15px">Regards,<br>Anand Reddy</p>
+<p style="color:#999;font-size:0.85em;text-align:center;margin-top:15px">Generated by Daily PO Report System</p>
+</body></html>""")
+
+        return '\n'.join(html)
+
     def generate_report(self):
         """Generate complete HTML report for all teams"""
         today = datetime.now().strftime("%B %d, %Y")
@@ -1175,7 +1568,7 @@ a:hover{{text-decoration:underline}}
         with open(last_sent_file, 'w') as f:
             f.write(today)
 
-    def send_email(self, html_content, dry_run=False, force=False):
+    def send_email(self, html_content, dry_run=False, force=False, subject=None):
         """Send email via SMTP"""
         # Check if already sent today (unless forced or dry-run)
         if not dry_run and not force and self.was_sent_today():
@@ -1184,7 +1577,8 @@ a:hover{{text-decoration:underline}}
 
         today = datetime.now().strftime("%B %d, %Y")
         is_monday = datetime.now().weekday() == 0
-        subject = f"FS Teams Daily Digest - {today}" + (" (with Weekend Activity)" if is_monday else "")
+        if subject is None:
+            subject = f"FS Teams Daily Digest - {today}" + (" (with Weekend Activity)" if is_monday else "")
 
         msg = MIMEMultipart('alternative')
         msg['Subject'] = subject
@@ -1251,11 +1645,46 @@ a:hover{{text-decoration:underline}}
         print(f"✓ Email sent successfully to {self.config['recipient']}")
 
 
+def update_confluence_after_email(config_path, page_id, dry_run=False):
+    """Update the Confluence FS-Digest page with today's data."""
+    try:
+        from confluence_digest import ConfluenceDigestGenerator, fetch_existing_page, update_confluence_page
+        print("\n--- Updating Confluence page ---")
+        gen = ConfluenceDigestGenerator(config_path)
+        new_content = gen.generate()
+
+        existing_body = ""
+        page_info = None
+        try:
+            page_info = fetch_existing_page(page_id)
+            existing_body = page_info["body"]
+            print(f"Fetched existing page (version {page_info['version']})")
+        except Exception as e:
+            print(f"Could not fetch existing page: {e}")
+
+        final_content = gen.build_with_archive(new_content, existing_body)
+        print(f"Confluence content: {len(final_content)} chars")
+
+        if dry_run:
+            print("Dry-run — Confluence NOT updated.")
+        elif page_info:
+            update_confluence_page(page_id, page_info["title"], final_content, page_info["version"])
+        else:
+            print("Cannot update — no existing page info.")
+    except Exception as e:
+        print(f"⚠ Confluence update failed (email was still sent): {e}")
+        import traceback
+        traceback.print_exc()
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate and send daily PO report")
     parser.add_argument("--dry-run", action="store_true", help="Generate report but don't send email")
     parser.add_argument("--force", action="store_true", help="Send even if already sent today")
     parser.add_argument("--check-only", action="store_true", help="Only check if report needed, don't send")
+    parser.add_argument("--digest", action="store_true", help="Send compact health-dashboard email with Confluence link")
+    parser.add_argument("--no-confluence", action="store_true", help="Skip Confluence page update")
+    parser.add_argument("--confluence-page-id", default="512524957", help="Confluence page ID for detail links")
     parser.add_argument("--config", default="email_config.json", help="Path to config file")
     args = parser.parse_args()
 
@@ -1272,8 +1701,20 @@ def main():
                 sys.exit(1)
 
         # Generate and send
-        html_content = generator.generate_report()
-        generator.send_email(html_content, dry_run=args.dry_run, force=args.force)
+        if args.digest:
+            html_content = generator.generate_digest_email(confluence_page_id=args.confluence_page_id)
+            today = datetime.now().strftime("%B %d, %Y")
+            is_monday = datetime.now().weekday() == 0
+            digest_subject = f"FS Health Dashboard — {today}" + (" (Weekend)" if is_monday else "")
+            generator.send_email(html_content, dry_run=args.dry_run, force=args.force, subject=digest_subject)
+        else:
+            html_content = generator.generate_report()
+            generator.send_email(html_content, dry_run=args.dry_run, force=args.force)
+
+        # Auto-update Confluence after email (unless --no-confluence)
+        if not args.no_confluence:
+            update_confluence_after_email(args.config, args.confluence_page_id, dry_run=args.dry_run)
+
     except Exception as e:
         print(f"ERROR: {str(e)}", file=sys.stderr)
         import traceback
